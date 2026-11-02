@@ -1,4 +1,4 @@
-# CCTV Viewer for macOS
+# Open-source CCTV App for macOS
 
 A fast, native macOS app for watching XMEye-based NVR/DVR security cameras (built for a
 **Securus Crimson** NVR; RTSP server "H264DVR 1.0"). Live view, playback of the NVR's own recordings,
