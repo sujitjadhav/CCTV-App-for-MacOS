@@ -17,7 +17,13 @@ jobs:
   dmg:
     runs-on: macos-15            # Apple Silicon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Use the newest Xcode on the runner
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app | grep -v -i beta | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          echo "Xcode: $XC"; swift --version; clang --version | head -1; sw_vers
 
       - name: Cache FFmpeg build
         uses: actions/cache@v4
@@ -33,7 +39,13 @@ jobs:
         run: /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${GITHUB_REF_NAME#v}" Info.plist
 
       - name: Build app and DMG
-        run: tools/release.sh --adhoc --dmg
+        run: |
+          set -o pipefail
+          tools/release.sh --adhoc --dmg 2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        run: grep -n -E "error|Error|failed|undefined" build.log | head -60 || true
 
       - name: Attach DMG to the release
         if: github.event_name == 'release'
@@ -41,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" dist/*.dmg --clobber
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: CCTV-dmg
           path: dist/*.dmg

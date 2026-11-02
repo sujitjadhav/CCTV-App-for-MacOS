@@ -176,13 +176,16 @@ struct TileView: View {
                     }
                     RoundButton(symbol: "camera.fill", help: "Copy a snapshot to the clipboard") { model.snapshot(camera) }
                         .disabled(!camera.status.isLive)
+                    if camera.audioOn && camera.hasAudio {
+                        SoundControls(camera: camera)
+                    }
                     RoundButton(symbol: camera.audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
                                 tint: camera.audioOn ? .green : .white,
-                                help: !camera.hasAudio && camera.status.isLive ? "This stream has no audio"
+                                help: !camera.hasAudio ? "This camera doesn't send sound (no microphone, or audio is off in the NVR)"
                                     : camera.audioOn ? "Sound on — click to mute" : "Sound off — click to unmute") {
                         model.setAudio(!camera.audioOn, for: camera)
                     }
-                    .opacity(camera.hasAudio || !camera.status.isLive ? 1 : 0.4)
+                    .opacity(camera.hasAudio ? 1 : 0.4)
                 }
                 .opacity(hovering || isFocused || camera.audioOn ? 1 : 0.55)
             }
@@ -231,6 +234,45 @@ struct TileView: View {
             let left = Int(retryAt.timeIntervalSince(now).rounded(.up))
             return left > 0 ? "\(m)\nReconnecting in \(left)s…" : "\(m)\nReconnecting…"
         }
+    }
+}
+
+/// Volume slider + level meter shown next to the speaker while sound is on.
+struct SoundControls: View {
+    @EnvironmentObject var model: AppModel
+    @ObservedObject var camera: Camera
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TimelineView(.periodic(from: .now, by: 0.12)) { _ in
+                LevelMeter(level: model.audioLevel(camera))
+            }
+            Slider(value: Binding(get: { Double(camera.volume) }, set: { model.setVolume(Float($0), for: camera) }), in: 0...1)
+                .controlSize(.mini)
+                .frame(width: 90)
+                .help("Volume")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(.black.opacity(0.55), in: Capsule())
+    }
+}
+
+/// Five little bars; flat = no sound is arriving from the camera.
+struct LevelMeter: View {
+    let level: Float
+    var body: some View {
+        let db = level > 0 ? 20 * log10(Double(level)) : -80     // −60…0 dB → 0…5 bars
+        let lit = Int(((db + 60) / 60 * 5).rounded(.up))
+        HStack(alignment: .bottom, spacing: 2) {
+            ForEach(0..<5, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(i < lit ? (i >= 4 ? Color.orange : Color.green) : Color.white.opacity(0.25))
+                    .frame(width: 3, height: CGFloat(5 + i * 3))
+            }
+        }
+        .frame(height: 17)
+        .help(level > 0.001 ? "Sound is arriving" : "No sound from this camera right now")
     }
 }
 

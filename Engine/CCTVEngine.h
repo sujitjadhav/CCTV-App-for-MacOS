@@ -32,6 +32,10 @@ typedef NS_ENUM(NSInteger, CCTVErrorKind) {
 - (void)start;
 - (void)stop;
 - (void)setAudioEnabled:(BOOL)on;
+/// Sound volume 0…1 (when audio is enabled).
+@property (nonatomic) float volume;
+/// Recent sound level 0…1 for a level meter (0 when nothing arrives).
+@property (nonatomic, readonly) float audioLevel;
 /// Latest decoded frame, or NULL if nothing has been shown yet.
 - (nullable CGImageRef)copySnapshot CF_RETURNS_RETAINED;
 /// Size of the last decoded frame (0x0 before the first frame).

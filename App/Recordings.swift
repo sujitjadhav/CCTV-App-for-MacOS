@@ -32,6 +32,13 @@ final class RecordingsModel: ObservableObject {
     @Published var loadedFraction = 0.0       // how much of the playing segment has arrived
     @Published var status: String?            // "Loading from NVR…", "Buffering…", …
     @Published var expanded = false           // player fills the window (like Live's full size)
+    @Published var soundOn = UserDefaults.standard.object(forKey: "playbackSound") as? Bool ?? true {
+        didSet { playback?.soundOn = soundOn; UserDefaults.standard.set(soundOn, forKey: "playbackSound") }
+    }
+    @Published var volume = UserDefaults.standard.object(forKey: "playbackVolume") as? Float ?? 1 {
+        didSet { playback?.volume = volume; UserDefaults.standard.set(volume, forKey: "playbackVolume") }
+    }
+    @Published var hasAudio = false
 
     let layer = AVSampleBufferDisplayLayer()
     private var playback: CCTVPlayback?
@@ -130,6 +137,9 @@ final class RecordingsModel: ObservableObject {
         loadedFraction = 0
         let pb = CCTVPlayback(layer: layer, timeZone: tz)
         pb.rate = speed
+        pb.soundOn = soundOn
+        pb.volume = volume
+        hasAudio = false
         pb.onEnded = { [weak self, weak pb] in
             guard let self, let pb, self.playback === pb else { return }
             self.playNext()
@@ -179,6 +189,7 @@ final class RecordingsModel: ObservableObject {
             nvrHonorsStartTime = abs(start.timeIntervalSince(asked)) < 60
         }
         if pb.hasPicture { playhead = start.addingTimeInterval(pb.position) }
+        if pb.hasAudio != hasAudio { hasAudio = pb.hasAudio }
         let dur = max(1, f.end.timeIntervalSince(f.begin))
         loadedFraction = pb.finished ? 1 : min(1, max(0, start.addingTimeInterval(pb.buffered).timeIntervalSince(f.begin) / dur))
         if let target = pendingSeek {
@@ -489,9 +500,19 @@ struct PlayerPanel: View {
                         .monospacedDigit().foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("Streams from the NVR · nothing saved on this Mac")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .lineLimit(1)
+                Button { rec.soundOn.toggle() } label: {
+                    Image(systemName: !rec.soundOn ? "speaker.slash.fill" : rec.speed == 1 ? "speaker.wave.2.fill" : "speaker.fill")
+                        .frame(width: 20)
+                        .foregroundStyle(rec.soundOn && rec.hasAudio && rec.speed == 1 ? Color.green : Color.primary)
+                }
+                .disabled(rec.playing != nil && !rec.hasAudio)
+                .help(rec.playing != nil && !rec.hasAudio ? "This recording has no sound"
+                      : rec.speed != 1 ? "Sound plays at 1× speed" : rec.soundOn ? "Sound on — click to mute" : "Sound off — click to unmute")
+                Slider(value: Binding(get: { Double(rec.volume) }, set: { rec.volume = Float($0) }), in: 0...1)
+                    .controlSize(.small)
+                    .frame(width: 100)
+                    .disabled(!rec.soundOn)
+                    .help("Volume")
                 Button { rec.expanded.toggle() } label: {
                     Image(systemName: rec.expanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                         .frame(width: 18)

@@ -779,12 +779,26 @@ done:
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
-typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t; } PFrame;
+typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; uint8_t audio; double t; } PFrame;
+
+// G.711 A-law -> 16-bit PCM.
+static int16_t alaw2linear(uint8_t a) {
+    a ^= 0x55;
+    int t = (a & 0x0F) << 4;
+    int seg = (a & 0x70) >> 4;
+    if (seg == 0) t += 8; else if (seg == 1) t += 0x108; else { t += 0x108; t <<= seg - 1; }
+    return (int16_t)((a & 0x80) ? t : -t);
+}
 
 @implementation CCTVPlayback {
     AVSampleBufferDisplayLayer *_layer;
     NSTimeZone *_tz;
-    CMTimebaseRef _tb;
+    AVSampleBufferRenderSynchronizer *_sync;   // one clock for picture and sound
+    AVSampleBufferAudioRenderer *_audio;
+    CMAudioFormatDescriptionRef _afmt;
+    double _audioNext;                          // time of the next audio sample
+    BOOL _hasAudio, _soundOn;
+    float _volume;
     pthread_mutex_t _mx;
     pthread_cond_t _cv;
     uint8_t *_buf; size_t _len, _cap;   // raw recording bytes (memory only)
@@ -794,6 +808,7 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
     int64_t _firstSec;
     double _next;                       // time of the next video frame
     double _fps;
+    double _lastT;                      // time of the newest video frame (audio frames don't count)
     size_t _decodeIdx;
     int _seekGen;
     float _rate;
@@ -809,11 +824,19 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
         _fps = 25;
         pthread_mutex_init(&_mx, NULL);
         pthread_cond_init(&_cv, NULL);
-        CMTimebaseCreateWithSourceClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &_tb);
-        CMTimebaseSetTime(_tb, kCMTimeZero);
-        CMTimebaseSetRate(_tb, 0);
+        _soundOn = YES;
+        _volume = 1;
         [_layer.sampleBufferRenderer flushWithRemovalOfDisplayedImage:YES completionHandler:nil];
-        _layer.controlTimebase = _tb;
+        _layer.controlTimebase = nil;
+        _sync = [AVSampleBufferRenderSynchronizer new];
+        _audio = [AVSampleBufferAudioRenderer new];
+        [_sync addRenderer:_layer.sampleBufferRenderer];
+        [_sync addRenderer:_audio];
+        [_sync setRate:0 time:kCMTimeZero];
+        AudioStreamBasicDescription asbd = { .mSampleRate = 8000, .mFormatID = kAudioFormatLinearPCM,
+            .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
+            .mBytesPerPacket = 2, .mFramesPerPacket = 1, .mBytesPerFrame = 2, .mChannelsPerFrame = 1, .mBitsPerChannel = 16 };
+        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &_afmt);
         NSThread *t = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
         t.qualityOfService = NSQualityOfServiceUserInteractive;
         t.name = @"cctv.playback";
@@ -825,12 +848,16 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
 - (void)dealloc {
     free(_buf);
     free(_fr);
-    if (_tb) CFRelease(_tb);
+    if (_afmt) CFRelease(_afmt);
     pthread_mutex_destroy(&_mx);
     pthread_cond_destroy(&_cv);
 }
 
 - (void)stop {
+    // Hand the shared video layer back so the next player can use it.
+    [_sync removeRenderer:_layer.sampleBufferRenderer atTime:kCMTimeInvalid completionHandler:nil];
+    [_sync removeRenderer:_audio atTime:kCMTimeInvalid completionHandler:nil];
+    [_audio flush];
     pthread_mutex_lock(&_mx);
     _stop = YES;
     pthread_cond_broadcast(&_cv);
@@ -873,17 +900,24 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
                 _startDate = xmDate(f.dt, _tz);
                 _next = 0;
             }
+            if (_started && f.kind == XK_A && f.media == 0x0E && f.len > 0) {
+                if (_n == _frCap) { _frCap = _frCap ? _frCap * 2 : 8192; _fr = realloc(_fr, _frCap * sizeof(PFrame)); }
+                double at = _lastT;
+                _fr[_n++] = (PFrame){ f.off, f.len, 0, f.media, 1, at };
+                _hasAudio = YES;
+            }
             if (_started && (f.kind == XK_I || f.kind == XK_P)) {
                 if (f.kind == XK_I) {
                     // Resync to the I-frame's wall clock when there's a gap in the recording.
                     int64_t s = xmSeconds(f.dt);
                     if (s >= 0 && _firstSec >= 0) {
                         double wall = (double)(s - _firstSec);
-                        if (fabs(wall - _next) > 2.0) _next = MAX(wall, _n ? _fr[_n - 1].t + 0.04 : 0);
+                        if (fabs(wall - _next) > 2.0) _next = MAX(wall, _n ? _lastT + 0.04 : 0);
                     }
                 }
                 if (_n == _frCap) { _frCap = _frCap ? _frCap * 2 : 8192; _fr = realloc(_fr, _frCap * sizeof(PFrame)); }
-                _fr[_n++] = (PFrame){ f.off, f.len, f.kind == XK_I, f.media, _next };
+                _fr[_n++] = (PFrame){ f.off, f.len, f.kind == XK_I, f.media, 0, _next };
+                _lastT = _next;
                 if (f.kind == XK_I && f.fps) _fps = f.fps;
                 _next += 1.0 / _fps;
             }
@@ -909,8 +943,15 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
 #pragma mark State (any thread)
 
 - (NSDate *)startDate { pthread_mutex_lock(&_mx); NSDate *d = _startDate; pthread_mutex_unlock(&_mx); return d; }
-- (double)position { return CMTimeGetSeconds(CMTimebaseGetTime(_tb)); }
-- (double)buffered { pthread_mutex_lock(&_mx); double b = _n ? _fr[_n - 1].t : 0; pthread_mutex_unlock(&_mx); return b; }
+- (double)position { return CMTimeGetSeconds(CMTimebaseGetTime(_sync.timebase)); }
+- (BOOL)hasAudio { pthread_mutex_lock(&_mx); BOOL a = _hasAudio; pthread_mutex_unlock(&_mx); return a; }
+- (BOOL)soundOn { return _soundOn; }
+- (void)setSoundOn:(BOOL)on { _soundOn = on; [self applyAudio]; }
+- (float)volume { return _volume; }
+- (void)setVolume:(float)v { _volume = v; [self applyAudio]; }
+// Sound plays at normal speed only (fast-forward is silent).
+- (void)applyAudio { _audio.volume = _volume; _audio.muted = !_soundOn || fabsf(_rate - 1) > 0.01f; }
+- (double)buffered { pthread_mutex_lock(&_mx); double b = _n ? _lastT : 0; pthread_mutex_unlock(&_mx); return b; }
 - (BOOL)finished { pthread_mutex_lock(&_mx); BOOL f = _finished; pthread_mutex_unlock(&_mx); return f; }
 - (BOOL)hasPicture { pthread_mutex_lock(&_mx); BOOL f = _haveFirstFrame; pthread_mutex_unlock(&_mx); return f; }
 - (BOOL)isStalled { pthread_mutex_lock(&_mx); BOOL s = _stalled; pthread_mutex_unlock(&_mx); return s; }
@@ -920,22 +961,25 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
 - (void)setRate:(float)rate {
     pthread_mutex_lock(&_mx);
     _rate = rate;
-    if (_haveFirstFrame && !_stalled) CMTimebaseSetRate(_tb, rate);
+    [self applyAudio];
+    if (_haveFirstFrame && !_stalled) [_sync setRate:rate];
     pthread_cond_broadcast(&_cv);
     pthread_mutex_unlock(&_mx);
 }
 
 - (BOOL)seekTo:(double)seconds {
     pthread_mutex_lock(&_mx);
-    if (_n == 0 || seconds > _fr[_n - 1].t + 0.5) { pthread_mutex_unlock(&_mx); return NO; }
+    if (_n == 0 || seconds > _lastT + 0.5) { pthread_mutex_unlock(&_mx); return NO; }
     size_t idx = 0;
     for (size_t i = 0; i < _n && _fr[i].t <= seconds; i++) if (_fr[i].key) idx = i;
     _decodeIdx = idx;
     _seekGen++;
     _endedSent = NO;
     double t = MAX(seconds, _fr[idx].t);
-    CMTimebaseSetTime(_tb, CMTimeMakeWithSeconds(t, 90000));
     [_layer.sampleBufferRenderer flushWithRemovalOfDisplayedImage:NO completionHandler:nil];
+    [_audio flush];
+    _audioNext = 0;
+    [_sync setRate:(_haveFirstFrame && !_stalled ? _rate : 0) time:CMTimeMakeWithSeconds(t, 90000)];
     pthread_cond_broadcast(&_cv);
     pthread_mutex_unlock(&_mx);
     return YES;
@@ -956,28 +1000,43 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
 
     pthread_mutex_lock(&_mx);
     while (!_stop) {
-        double now = CMTimeGetSeconds(CMTimebaseGetTime(_tb));
+        double now = CMTimeGetSeconds(CMTimebaseGetTime(_sync.timebase));
         double ahead = 1.0 + 0.75 * MAX(_rate, 1);
 
         if (_decodeIdx >= _n) {
             if (_finished) {
-                if (!_endedSent && _n && now >= _fr[_n - 1].t) {
+                if (!_endedSent && _n && now >= _lastT) {
                     _endedSent = YES;
                     void (^cb)(void) = self.onEnded;
                     if (cb) dispatch_async(dispatch_get_main_queue(), cb);
                 }
-            } else if (_haveFirstFrame && !_stalled && _n && now > _fr[_n - 1].t) {
+            } else if (_haveFirstFrame && !_stalled && _n && now > _lastT) {
                 _stalled = YES;                              // download is behind playback: wait
-                CMTimebaseSetRate(_tb, 0);
+                [_sync setRate:0];
             }
             [self waitLocked:0.05];
             continue;
         }
-        if (_stalled && (_finished || _fr[_n - 1].t > now + ahead)) {
+        if (_stalled && (_finished || _lastT > now + ahead)) {
             _stalled = NO;
-            CMTimebaseSetRate(_tb, _rate);
+            [_sync setRate:_rate];
         }
         PFrame f = _fr[_decodeIdx];
+        if (f.audio) {
+            // Audio: decode G.711A and queue it at the time of the video around it.
+            _decodeIdx++;
+            if (_haveFirstFrame && f.t >= now - 0.2) {
+                double t = (_audioNext > 0 && fabs(_audioNext - f.t) < 0.5) ? _audioNext : f.t;
+                size_t ns = f.len;
+                int16_t *pcm = malloc(ns * 2);
+                for (size_t i = 0; i < ns; i++) pcm[i] = alaw2linear(_buf[f.off + i]);
+                _audioNext = t + (double)ns / 8000.0;
+                pthread_mutex_unlock(&_mx);
+                [self enqueueAudio:pcm samples:ns at:t];
+                pthread_mutex_lock(&_mx);
+            }
+            continue;
+        }
         if (_haveFirstFrame && f.t > now + ahead) { [self waitLocked:0.03]; continue; }
 
         // Copy the frame out so the buffer may grow while we decode.
@@ -1044,8 +1103,7 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
                         if (!_haveFirstFrame) {
                             // First picture: start the clock here.
                             _haveFirstFrame = YES;
-                            CMTimebaseSetTime(_tb, CMTimeMake(pts, 90000));
-                            CMTimebaseSetRate(_tb, _rate);
+                            [_sync setRate:_rate time:CMTimeMake(pts, 90000)];
                         }
                         pthread_mutex_unlock(&_mx);
                     }
@@ -1065,6 +1123,23 @@ typedef struct { size_t off; uint32_t len; uint8_t key; uint8_t media; double t;
     av_frame_free(&frame);
     avcodec_free_context(&ctx);
     av_buffer_unref(&hw);
+}
+
+// Takes ownership of pcm.
+- (void)enqueueAudio:(int16_t *)pcm samples:(size_t)n at:(double)t {
+    CMBlockBufferRef block = NULL;
+    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, pcm, n * 2, kCFAllocatorMalloc, NULL, 0, n * 2, 0, &block) != noErr) {
+        free(pcm);
+        return;
+    }
+    CMSampleBufferRef sb = NULL;
+    if (CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, block, _afmt, (CMItemCount)n,
+                                                             CMTimeMakeWithSeconds(t, 8000), NULL, &sb) == noErr) {
+        if (_audio.status == AVQueuedSampleBufferRenderingStatusFailed) [_audio flush];
+        [_audio enqueueSampleBuffer:sb];
+        CFRelease(sb);
+    }
+    CFRelease(block);
 }
 
 - (void)waitLocked:(double)seconds {

@@ -51,7 +51,7 @@ typedef NS_ERROR_ENUM(CCTVConvertErrorDomain, CCTVConvertErrorCode) {
 @end
 
 /// Plays an XMEye recording while it is still arriving from the NVR (memory only, nothing on disk).
-/// Feed bytes with appendData:, call finishData when the download ends. Video only.
+/// Feed bytes with appendData:, call finishData when the download ends. Video + G.711A sound.
 @interface CCTVPlayback : NSObject
 - (instancetype)initWithLayer:(AVSampleBufferDisplayLayer *)layer timeZone:(NSTimeZone *)tz;
 - (instancetype)init NS_UNAVAILABLE;
@@ -69,6 +69,10 @@ typedef NS_ERROR_ENUM(CCTVConvertErrorDomain, CCTVConvertErrorCode) {
 @property (nonatomic, readonly) BOOL hasPicture;
 @property (nonatomic, readonly, getter=isStalled) BOOL stalled;
 @property (nonatomic, readonly) size_t bytesReceived;
+/// Recording has sound (G.711A). Sound plays at 1× only.
+@property (nonatomic, readonly) BOOL hasAudio;
+@property (nonatomic) BOOL soundOn;
+@property (nonatomic) float volume;   // 0…1
 /// Jumps within the part that has arrived; NO if that time hasn't arrived yet.
 - (BOOL)seekTo:(double)seconds;
 /// Main queue: playback reached the end of a fully downloaded recording.

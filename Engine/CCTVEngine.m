@@ -27,6 +27,8 @@ typedef struct {
     _Atomic int64_t lastAudioDone;
     atomic_int statFrames;
     atomic_int width, height;
+    _Atomic float level;        // recent audio level 0…1 (for the meter)
+    _Atomic float volume;       // 0…1
 } StreamCtl;
 
 static int interruptCB(void *opaque) {
@@ -169,6 +171,7 @@ static CCTVErrorKind classify(int r, NSString **msg) {
         _url = [url copy];
         _layer = layer;
         _ctl = calloc(1, sizeof(StreamCtl));
+        atomic_store(&_ctl->volume, 1.0f);
         _snapLock = OS_UNFAIR_LOCK_INIT;
     }
     return self;
@@ -195,6 +198,18 @@ static CCTVErrorKind classify(int r, NSString **msg) {
 }
 
 - (int)takeFrameCount { return atomic_exchange(&_ctl->statFrames, 0); }
+- (float)volume { return atomic_load(&_ctl->volume); }
+- (void)setVolume:(float)v {
+    atomic_store(&_ctl->volume, v);
+    AVAudioPlayerNode *p = self.player;
+    if (p) p.volume = v;
+}
+- (float)audioLevel {
+    // Decays when no sound arrives.
+    float l = atomic_load(&_ctl->level);
+    atomic_store(&_ctl->level, l * 0.6f);
+    return l;
+}
 - (CGSize)videoSize { return CGSizeMake(atomic_load(&_ctl->width), atomic_load(&_ctl->height)); }
 
 - (void)setAudioEnabled:(BOOL)on {
@@ -332,6 +347,7 @@ static CCTVErrorKind classify(int r, NSString **msg) {
                                 swr_init(swr) < 0) { swr_free(&swr); av_frame_unref(frame); continue; }
                             audioRate = frame->sample_rate;
                             player = [[CCTVAudioHub shared] playerForSampleRate:audioRate];
+                            player.volume = atomic_load(&_ctl->volume);
                             self.player = player;
                         }
                         if (player) [self playAudioFrame:frame swr:swr player:player rate:audioRate];
@@ -374,6 +390,12 @@ done:
     int n = swr_convert(swr, out, cap, (const uint8_t **)frame->extended_data, frame->nb_samples);
     if (n <= 0) return;
     buf.frameLength = n;
+    {   // peak level for the meter
+        float peak = 0; const float *d = buf.floatChannelData[0];
+        for (int i = 0; i < n; i++) { float a = fabsf(d[i]); if (a > peak) peak = a; }
+        float cur = atomic_load(&_ctl->level);
+        atomic_store(&_ctl->level, MAX(peak, cur));
+    }
 
     // Keep at most ~500ms queued so sound stays in sync with the live picture.
     int64_t now = av_gettime_relative();

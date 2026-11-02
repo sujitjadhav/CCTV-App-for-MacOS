@@ -18,7 +18,7 @@ enum PhaseSelfTest {
                 if let f = first { rec.play(f, at: f.begin.addingTimeInterval(5)) }
             }),
             (10, { log("2s after play: \(rec.debugState) playhead=\(rec.playhead.map { hm.string(from: $0) } ?? "-")") }),
-            (14, { log("after 4s: \(rec.debugState)"); rec.setSpeed(4) }),
+            (14, { log("after 4s: \(rec.debugState) hasAudio=\(rec.hasAudio) soundOn=\(rec.soundOn)"); rec.setSpeed(4) }),
             (15, { rec.expanded = true }),
             (16.5, { log("full size: expanded=\(rec.expanded) \(rec.debugState)"); rec.expanded = false }),
             (17.5, { log("back to list: expanded=\(rec.expanded) \(rec.debugState)") }),

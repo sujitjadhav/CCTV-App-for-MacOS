@@ -129,7 +129,13 @@ package() {   # creates $PKG from $APP
     ln -s /Applications "$stage/Applications"
     # Unnotarized builds: explain how to get past Gatekeeper the first time.
     [[ $MODE == release ]] || cp "$ROOT/tools/HowToOpen.txt" "$stage/How to Open CCTV.txt"
-    hdiutil create -quiet -volname "CCTV $VERSION" -srcfolder "$stage" -ov -format UDZO "$PKG"
+    # hdiutil sometimes fails with "Resource busy" on CI machines: retry a few times.
+    local try
+    for try in 1 2 3 4; do
+      hdiutil create -quiet -volname "CCTV $VERSION" -srcfolder "$stage" -ov -format UDZO "$PKG" && break
+      (( try == 4 )) && stop "hdiutil create failed"
+      print -u2 "hdiutil failed, retrying in 5 s…"; sleep 5
+    done
     rm -rf "$stage"
     [[ $SIGN_ID == - ]] || codesign --force --sign "$SIGN_ID" --timestamp "$PKG"
   fi
