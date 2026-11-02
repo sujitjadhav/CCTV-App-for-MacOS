@@ -127,20 +127,22 @@ package() {   # creates $PKG from $APP
     rm -rf "$stage"; mkdir -p "$stage"
     ditto "$APP" "$stage/CCTV.app"
     ln -s /Applications "$stage/Applications"
+    # Unnotarized builds: explain how to get past Gatekeeper the first time.
+    [[ $MODE == release ]] || cp "$ROOT/tools/HowToOpen.txt" "$stage/How to Open CCTV.txt"
     hdiutil create -quiet -volname "CCTV $VERSION" -srcfolder "$stage" -ov -format UDZO "$PKG"
     rm -rf "$stage"
     [[ $SIGN_ID == - ]] || codesign --force --sign "$SIGN_ID" --timestamp "$PKG"
   fi
 }
-PKG=$DIST/CCTV-$VERSION.$FORMAT
+PKG=$DIST/CCTV-$VERSION-macOS-$( [[ $(uname -m) == arm64 ]] && echo AppleSilicon || echo Intel ).$FORMAT
 step "Packaging $PKG"
 package
 
 if [[ $MODE == adhoc ]]; then
   step "Done (ad-hoc, not notarized)"
   print "Created $PKG
-This is ad-hoc signed: it runs on this Mac, but other Macs will block it
-(\"Apple could not verify…\"). Use a Developer ID + NOTARY_PROFILE for a real release."
+Not notarized: on other Macs, users approve it once (System Settings → Privacy & Security →
+Open Anyway; see "How to Open CCTV.txt" inside the DMG). A Developer ID + NOTARY_PROFILE removes that step."
   spctl -a -vv -t exec "$APP" 2>&1 || true
   exit 0
 fi

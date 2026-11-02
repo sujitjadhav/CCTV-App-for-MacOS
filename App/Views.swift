@@ -6,6 +6,7 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject private var alerts = AlertCenter.shared
+    @ObservedObject private var rec = RecordingsModel.shared
     @State private var columns: NavigationSplitViewVisibility = .all
 
     var body: some View {
@@ -36,6 +37,9 @@ struct RootView: View {
         // Full-size camera view uses the whole window.
         .onChange(of: model.focused) { _, f in
             withAnimation(.easeInOut(duration: 0.2)) { columns = f == nil ? .all : .detailOnly }
+        }
+        .onChange(of: rec.expanded) { _, on in
+            withAnimation(.easeInOut(duration: 0.2)) { columns = on ? .detailOnly : .all }
         }
     }
 }

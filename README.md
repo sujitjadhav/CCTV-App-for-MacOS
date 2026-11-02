@@ -6,6 +6,19 @@ motion alerts and a menu bar item — **without recording or storing anything on
 
 > Not affiliated with Securus, Xiongmai or XMEye. Use it only with cameras and NVRs you own or are allowed to access.
 
+## Download
+
+Get **CCTV-x.y.z-macOS-AppleSilicon.dmg** from the [Releases](../../releases) page (macOS 14+, Apple Silicon).
+
+1. Open the DMG and drag **CCTV** into **Applications**.
+2. Open CCTV. The download isn't notarized by Apple, so the first time macOS blocks it:
+   - **macOS 15+**: System Settings → Privacy & Security → scroll down → **Open Anyway** next to CCTV.
+   - **macOS 14**: right-click CCTV in Applications → **Open** → **Open**.
+3. In **Settings**, enter the NVR's IP address, username and password → **Test Connection** → **Save**.
+   Allow **Local Network** access when macOS asks.
+
+Intel Macs: build from source (below).
+
 ## Features
 
 - **Live view** — 1×1, 2×2 and 1 large + 3 small layouts. The grid uses low-bandwidth substreams; the large /
@@ -14,8 +27,8 @@ motion alerts and a menu bar item — **without recording or storing anything on
   moment they arrive. Streams pause when the window is minimized, hidden, covered, or the Mac sleeps.
 - **Status & recovery** — LIVE / CONNECTING / ERROR badge per camera, automatic reconnect with backoff.
 - **Recordings from the NVR's hard disk** — pick a camera and day, see a 24-hour timeline, click to jump,
-  play at 1× / 2× / 4× / 8×. Video streams from the NVR and starts in a second or two; it's held in memory
-  only and released when you leave the screen.
+  play at 1× / 2× / 4× / 8×, full-size view (double-click or Esc). Video streams from the NVR and starts in a
+  second or two; it's held in memory only and released when you leave the screen.
 - **Alerts** — NVR motion/alarm events as macOS notifications (per-camera toggle, quiet hours); clicking one opens
   that camera live. An event log links each alert to the recording at that moment.
 - **Menu bar** — camera previews and recent alerts; keeps running when the window is closed; open at login.
@@ -23,14 +36,16 @@ motion alerts and a menu bar item — **without recording or storing anything on
 - **Settings** — NVR IP, RTSP and DVRIP ports, username, password (stored in the macOS **Keychain**), and a
   **Test Connection** button that checks RTSP (401 without a password, 200 with it) and DVRIP login.
 
-## Requirements
+## Build from source
+
+### Requirements
 
 - macOS 14 Sonoma or newer (Apple Silicon or Intel)
 - Xcode Command Line Tools: `xcode-select --install`
 - [Homebrew](https://brew.sh) FFmpeg: `brew install ffmpeg`
 - An XMEye-based NVR/DVR reachable on your network (RTSP port 554, DVRIP port 34567)
 
-## Build and install
+### Build and install
 
 ```bash
 git clone https://github.com/<you>/<repo>.git
@@ -44,7 +59,15 @@ On first launch, open **Settings**, enter the NVR's IP, username and password, p
 **Save**. Allow **Local Network** access when macOS asks (or later in System Settings → Privacy & Security →
 Local Network).
 
-Signed and notarized builds for other Macs: see [docs/SIGNING.md](docs/SIGNING.md).
+Optional: `tools/build_ffmpeg.sh` builds a small LGPL-only FFmpeg into `vendor/` (about 5 minutes);
+`./build.sh` then uses it instead of Homebrew's, and the app no longer needs Homebrew at all.
+
+### Making a release
+
+Publish a release on GitHub with a tag like `v1.0.1`. The **Release DMG** workflow
+([.github/workflows/release.yml](.github/workflows/release.yml)) builds FFmpeg (LGPL), the app and the DMG on
+GitHub's Macs and attaches the DMG to the release. Locally, `tools/release.sh --adhoc --dmg` makes the same DMG
+in `dist/`. Signed and notarized builds (no "Open Anyway" step): see [docs/SIGNING.md](docs/SIGNING.md).
 
 ## Compatibility
 
@@ -92,6 +115,7 @@ See the header of [tools/dvrip_check.swift](tools/dvrip_check.swift) for the pro
 
 [MIT](LICENSE) for this project's source code.
 
-FFmpeg is a separate project. Homebrew's FFmpeg is built with GPL components (x264, x265), so an app bundle that
-includes those libraries must be distributed under GPL terms — see [docs/SIGNING.md](docs/SIGNING.md) for
-details and an LGPL-only alternative. Building from source for yourself is unaffected.
+The DMGs on the Releases page are built with a minimal **LGPL** FFmpeg ([FFmpeg](https://ffmpeg.org) 9.0.2,
+configured by [tools/build_ffmpeg.sh](tools/build_ffmpeg.sh), linked statically; this repository has everything
+needed to rebuild and relink it). A DMG built locally against Homebrew's FFmpeg includes GPL components
+(x264, x265) and would have to be distributed under the GPL — see [docs/SIGNING.md](docs/SIGNING.md).

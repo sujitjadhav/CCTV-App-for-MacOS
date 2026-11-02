@@ -1,0 +1,47 @@
+# Builds the downloadable DMG on GitHub's Macs.
+# - Publish a GitHub Release (tag like v1.0.0) -> the DMG is attached to that release.
+# - Or run it by hand (Actions tab -> Release DMG -> Run workflow) -> DMG is kept as a build artifact.
+# FFmpeg is built from source as a small LGPL-only static library (tools/build_ffmpeg.sh),
+# so the download contains no GPL code and doesn't need Homebrew on the user's Mac.
+name: Release DMG
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-15            # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache FFmpeg build
+        uses: actions/cache@v4
+        with:
+          path: vendor/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build_ffmpeg.sh') }}
+
+      - name: Build FFmpeg (LGPL, static)
+        run: '[ -f vendor/ffmpeg/lib/libavformat.a ] || tools/build_ffmpeg.sh'
+
+      - name: Version from release tag
+        if: github.event_name == 'release'
+        run: /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${GITHUB_REF_NAME#v}" Info.plist
+
+      - name: Build app and DMG
+        run: tools/release.sh --adhoc --dmg
+
+      - name: Attach DMG to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/*.dmg --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CCTV-dmg
+          path: dist/*.dmg

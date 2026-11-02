@@ -31,6 +31,7 @@ final class RecordingsModel: ObservableObject {
     @Published var paused = false
     @Published var loadedFraction = 0.0       // how much of the playing segment has arrived
     @Published var status: String?            // "Loading from NVR…", "Buffering…", …
+    @Published var expanded = false           // player fills the window (like Live's full size)
 
     let layer = AVSampleBufferDisplayLayer()
     private var playback: CCTVPlayback?
@@ -96,6 +97,7 @@ final class RecordingsModel: ObservableObject {
 
     /// Stops playback and frees memory (when leaving the Recordings screen).
     func releaseMemory() {
+        expanded = false
         stopPlayback()
         playing = nil
         playhead = nil
@@ -244,6 +246,23 @@ struct RecordingsView: View {
     @ObservedObject var rec = RecordingsModel.shared
 
     var body: some View {
+        Group {
+            if rec.expanded {
+                PlayerPanel(rec: rec)
+            } else {
+                browser
+            }
+        }
+        .navigationTitle(rec.expanded ? "\(app.cameras[min(rec.channel, app.cameras.count - 1)].displayName) · Recording" : "Recordings")
+        .onAppear { if rec.files.isEmpty && !rec.loading { rec.load() } }
+        .onDisappear { rec.releaseMemory() }
+        .onChange(of: rec.channel) { _, _ in rec.load() }
+        .onChange(of: rec.day) { old, new in
+            if rec.calendar.startOfDay(for: old) != rec.calendar.startOfDay(for: new) { rec.load() }
+        }
+    }
+
+    private var browser: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Picker("Camera", selection: $rec.channel) {
@@ -271,13 +290,6 @@ struct RecordingsView: View {
                     .frame(minWidth: 420)
             }
             .padding(.top, 8)
-        }
-        .navigationTitle("Recordings")
-        .onAppear { if rec.files.isEmpty && !rec.loading { rec.load() } }
-        .onDisappear { rec.releaseMemory() }
-        .onChange(of: rec.channel) { _, _ in rec.load() }
-        .onChange(of: rec.day) { old, new in
-            if rec.calendar.startOfDay(for: old) != rec.calendar.startOfDay(for: new) { rec.load() }
         }
     }
 }
@@ -382,6 +394,7 @@ struct PlaybackLayerView: NSViewRepresentable {
 
     final class Host: NSView {
         var video: AVSampleBufferDisplayLayer?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
         override func layout() {
             super.layout()
             CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -445,6 +458,8 @@ struct PlayerPanel: View {
         VStack(spacing: 8) {
             ZStack {
                 PlaybackLayerView(layer: rec.layer)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { if rec.playing != nil { rec.expanded.toggle() } }
                 if let st = rec.status {
                     VStack(spacing: 8) {
                         ProgressView().controlSize(.small)
@@ -476,6 +491,12 @@ struct PlayerPanel: View {
                 Spacer()
                 Text("Streams from the NVR · nothing saved on this Mac")
                     .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Button { rec.expanded.toggle() } label: {
+                    Image(systemName: rec.expanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .frame(width: 18)
+                }
+                .help(rec.expanded ? "Back to recordings list (Esc)" : "Full size (double-click the video)")
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 10)

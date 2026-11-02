@@ -251,11 +251,12 @@ final class AppModel: ObservableObject {
         }
         // Esc leaves the full-size view (unless a dialog or text field is using it).
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self, e.keyCode == 53, self.focused != nil, self.section == .live,
+            guard let self, e.keyCode == 53,
                   let w = e.window, w.attachedSheet == nil, !(w is NSPanel),
                   !(w.firstResponder is NSTextView) else { return e }
-            self.focus(nil)
-            return nil
+            if self.section == .live, self.focused != nil { self.focus(nil); return nil }
+            if self.section == .recordings, RecordingsModel.shared.expanded { RecordingsModel.shared.expanded = false; return nil }
+            return e
         }
     }
 

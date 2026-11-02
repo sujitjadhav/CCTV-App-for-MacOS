@@ -19,6 +19,9 @@ enum PhaseSelfTest {
             }),
             (10, { log("2s after play: \(rec.debugState) playhead=\(rec.playhead.map { hm.string(from: $0) } ?? "-")") }),
             (14, { log("after 4s: \(rec.debugState)"); rec.setSpeed(4) }),
+            (15, { rec.expanded = true }),
+            (16.5, { log("full size: expanded=\(rec.expanded) \(rec.debugState)"); rec.expanded = false }),
+            (17.5, { log("back to list: expanded=\(rec.expanded) \(rec.debugState)") }),
             (18, { log("4x for 4s: \(rec.debugState) playhead=\(rec.playhead.map { hm.string(from: $0) } ?? "-")"); rec.setSpeed(1)
                    if let f = rec.files.first { rec.seek(to: f.begin.addingTimeInterval(3)) } }),
             (20, { log("seek back to +3s: playhead=\(rec.playhead.map { hm.string(from: $0) } ?? "-")")

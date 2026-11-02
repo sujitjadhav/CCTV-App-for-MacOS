@@ -14,3 +14,6 @@ xcuserdata/
 *.mp4
 *.png
 !docs/*.png
+
+# Locally built FFmpeg (tools/build_ffmpeg.sh)
+vendor/

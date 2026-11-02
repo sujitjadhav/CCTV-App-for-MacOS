@@ -1,0 +1,20 @@
+CCTV — how to install
+=====================
+
+1. Drag CCTV into the Applications folder.
+2. Open CCTV from Applications.
+
+The first time, macOS may say it "can't verify" CCTV, because this free build isn't
+notarized by Apple. To open it anyway (only needed once):
+
+  • macOS 15 Sequoia or newer: click Done, then open System Settings → Privacy & Security,
+    scroll down and click "Open Anyway" next to CCTV, and confirm.
+  • macOS 14 Sonoma: right-click (Control-click) CCTV in Applications → Open → Open.
+
+Or, in Terminal:   xattr -dr com.apple.quarantine /Applications/CCTV.app
+
+3. In CCTV, open Settings, enter your NVR's IP address, username and password,
+   click Test Connection, then Save. Allow "Local Network" access when asked.
+
+Requires macOS 14 or newer and an XMEye-based NVR/DVR on your network.
+Source code, help and license: see the project page on GitHub.
