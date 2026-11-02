@@ -1,0 +1,16 @@
+# Build output
+build/
+dist/
+*.o
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+.swiftpm/
+*.ips
+
+# Test media (never commit camera footage)
+*.h264
+*.mp4
+*.png
+!docs/*.png
