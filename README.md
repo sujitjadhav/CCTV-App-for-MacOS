@@ -66,7 +66,7 @@ watch live, or open the recording from the event log.
 
 ### 🧭 Menu bar
 Camera previews and recent alerts one click away. Keeps running when the window is closed;
-optional **open at login**.
+optional **open at login**. A **Device** page shows the NVR's model, firmware, network and disk usage.
 
 </td>
 <td valign="top">

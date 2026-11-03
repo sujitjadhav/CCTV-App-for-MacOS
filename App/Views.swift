@@ -16,6 +16,7 @@ struct RootView: View {
                 Label("Recordings", systemImage: "film.stack").tag(AppSection.recordings)
                 Label("Events", systemImage: "bell").tag(AppSection.events)
                     .badge(alerts.unseen)
+                Label("Device", systemImage: "server.rack").tag(AppSection.device)
                 Label("Settings", systemImage: "gearshape").tag(AppSection.settings)
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 180, max: 240)
@@ -24,6 +25,7 @@ struct RootView: View {
             case .live: LiveView()
             case .recordings: RecordingsView()
             case .events: EventsView()
+            case .device: DeviceView()
             case .settings: SettingsView()
             }
         }
@@ -138,7 +140,14 @@ struct TileView: View {
 
     var body: some View {
         ZStack {
+            // Clicks on the picture: double-click = full size; in 1+3, single click = make it large.
+            // (Kept on the video only, so the buttons on top always get their clicks.)
             VideoView(host: camera.video)
+                .contentShape(Rectangle())
+                .gesture(TapGesture(count: 2).onEnded { model.toggleFocus(index) }
+                    .exclusively(before: TapGesture().onEnded {
+                        if model.focused == nil && model.layout == .onePlusThree && model.primary != index { model.primary = index }
+                    }))
 
             if camera.status != .live && camera.status != .idle("") {
                 VStack(spacing: 10) {
@@ -176,28 +185,18 @@ struct TileView: View {
                     }
                     RoundButton(symbol: "camera.fill", help: "Copy a snapshot to the clipboard") { model.snapshot(camera) }
                         .disabled(!camera.status.isLive)
-                    if camera.audioOn && camera.hasAudio {
-                        SoundControls(camera: camera)
-                    }
-                    RoundButton(symbol: camera.audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
-                                tint: camera.audioOn ? .green : .white,
-                                help: !camera.hasAudio ? "This camera doesn't send sound (no microphone, or audio is off in the NVR)"
-                                    : camera.audioOn ? "Sound on — click to mute" : "Sound off — click to unmute") {
+                    SpeakerControl(on: camera.audioOn, available: camera.hasAudio,
+                                   volume: Binding(get: { camera.volume }, set: { model.setVolume($0, for: camera) }),
+                                   level: { model.audioLevel(camera) },
+                                   unavailableHelp: "This camera doesn't send sound (no microphone, or audio is off in the NVR)") {
                         model.setAudio(!camera.audioOn, for: camera)
                     }
-                    .opacity(camera.hasAudio ? 1 : 0.4)
                 }
                 .opacity(hovering || isFocused || camera.audioOn ? 1 : 0.55)
             }
             .padding(10)
         }
         .clipped()
-        .contentShape(Rectangle())
-        .gesture(TapGesture(count: 2).onEnded { model.toggleFocus(index) }
-            .exclusively(before: TapGesture().onEnded {
-                // In 1+3, clicking a small camera makes it the big one.
-                if model.focused == nil && model.layout == .onePlusThree && model.primary != index { model.primary = index }
-            }))
         .onHover { hovering = $0 }
         .contextMenu {
             Button(isFocused ? "Back to Layout" : "View Full Size (HD)") { model.toggleFocus(index) }
@@ -237,41 +236,133 @@ struct TileView: View {
     }
 }
 
-/// Volume slider + level meter shown next to the speaker while sound is on.
-struct SoundControls: View {
-    @EnvironmentObject var model: AppModel
-    @ObservedObject var camera: Camera
+/// Speaker button: click = sound on/off. While sound is on, hovering shows a vertical volume slider above it.
+struct SpeakerControl: View {
+    let on: Bool
+    let available: Bool
+    @Binding var volume: Float
+    var level: (() -> Float)? = nil
+    var unavailableHelp = "No sound"
+    var round = true
+    let toggle: () -> Void
+
+    @State private var overButton = false
+    @State private var overPopup = false
+    @State private var dragging = false
+    @State private var open = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            TimelineView(.periodic(from: .now, by: 0.12)) { _ in
-                LevelMeter(level: model.audioLevel(camera))
+        button
+            .onHover { overButton = $0; update() }
+            .overlay(alignment: .bottom) {
+                if open && on && available {
+                    VolumePopup(volume: $volume, level: level, dragging: $dragging)
+                        .onHover { overPopup = $0; update() }
+                        .offset(y: -(round ? 42 : 34))
+                        .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .bottom)))
+                        .zIndex(10)
+                }
             }
-            Slider(value: Binding(get: { Double(camera.volume) }, set: { model.setVolume(Float($0), for: camera) }), in: 0...1)
-                .controlSize(.mini)
-                .frame(width: 90)
-                .help("Volume")
+            .animation(.easeOut(duration: 0.12), value: open)
+            .onChange(of: dragging) { _, _ in update() }
+    }
+
+    @ViewBuilder private var button: some View {
+        let symbol = !on ? "speaker.slash.fill" : volume < 0.01 ? "speaker.fill" : volume < 0.5 ? "speaker.wave.1.fill" : "speaker.wave.2.fill"
+        let help = !available ? unavailableHelp : on ? "Sound on — click to mute, hover for volume" : "Sound off — click to turn on"
+        if round {
+            RoundButton(symbol: symbol, tint: on && available ? .green : .white, help: help, action: toggle)
+                .opacity(available ? 1 : 0.4)
+        } else {
+            Button(action: toggle) {
+                Image(systemName: symbol).frame(width: 20)
+                    .foregroundStyle(on && available ? Color.green : Color.primary)
+            }
+            .help(help)
+            .disabled(!available)
         }
-        .padding(.horizontal, 10)
-        .frame(height: 34)
-        .background(.black.opacity(0.55), in: Capsule())
+    }
+
+    /// Opens at once; closes shortly after the pointer leaves both the button and the slider.
+    private func update() {
+        if overButton || overPopup || dragging { open = true; return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            if !overButton && !overPopup && !dragging { open = false }
+        }
     }
 }
 
-/// Five little bars; flat = no sound is arriving from the camera.
-struct LevelMeter: View {
-    let level: Float
+struct VolumePopup: View {
+    @Binding var volume: Float
+    var level: (() -> Float)?
+    @Binding var dragging: Bool
+
     var body: some View {
-        let db = level > 0 ? 20 * log10(Double(level)) : -80     // −60…0 dB → 0…5 bars
-        let lit = Int(((db + 60) / 60 * 5).rounded(.up))
-        HStack(alignment: .bottom, spacing: 2) {
-            ForEach(0..<5, id: \.self) { i in
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(i < lit ? (i >= 4 ? Color.orange : Color.green) : Color.white.opacity(0.25))
-                    .frame(width: 3, height: CGFloat(5 + i * 3))
+        VStack(spacing: 6) {
+            Text("\(Int((volume * 100).rounded()))%")
+                .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                .foregroundStyle(.white)
+            HStack(alignment: .bottom, spacing: 6) {
+                if let level {
+                    TimelineView(.periodic(from: .now, by: 0.12)) { _ in VerticalLevel(level: level()) }
+                }
+                VerticalSlider(value: $volume, dragging: $dragging)
             }
         }
-        .frame(height: 17)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 9)
+        .background(.black.opacity(0.75), in: Capsule())
+        .overlay(Capsule().stroke(.white.opacity(0.15)))
+        .shadow(radius: 6)
+    }
+}
+
+/// Tall volume slider: drag or click anywhere on it.
+struct VerticalSlider: View {
+    @Binding var value: Float
+    @Binding var dragging: Bool
+    var height: CGFloat = 96
+
+    var body: some View {
+        GeometryReader { g in
+            let h = g.size.height
+            let y = h * CGFloat(1 - value)
+            ZStack(alignment: .bottom) {
+                Capsule().fill(.white.opacity(0.22)).frame(width: 6)
+                Capsule().fill(Color.green).frame(width: 6, height: max(6, h - y))
+                Circle().fill(.white).frame(width: 14, height: 14).shadow(radius: 1)
+                    .position(x: g.size.width / 2, y: min(max(7, y), h - 7))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { v in dragging = true; value = Float(min(1, max(0, 1 - v.location.y / h))) }
+                .onEnded { _ in dragging = false })
+        }
+        .frame(width: 20, height: height)
+        .help("Volume")
+        .accessibilityElement()
+        .accessibilityLabel("Volume")
+        .accessibilityValue("\(Int(value * 100)) percent")
+        .accessibilityAdjustableAction { dir in
+            value = min(1, max(0, value + (dir == .increment ? 0.1 : -0.1)))
+        }
+    }
+}
+
+/// Vertical sound level bars; flat = no sound is arriving from the camera.
+struct VerticalLevel: View {
+    let level: Float
+    var body: some View {
+        let db = level > 0 ? 20 * log10(Double(level)) : -80
+        let lit = Int(((db + 60) / 60 * 8).rounded(.up))
+        VStack(spacing: 2) {
+            ForEach((0..<8).reversed(), id: \.self) { i in
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(i < lit ? (i >= 6 ? Color.orange : Color.green) : Color.white.opacity(0.2))
+                    .frame(width: 4, height: 9)
+            }
+        }
         .help(level > 0.001 ? "Sound is arriving" : "No sound from this camera right now")
     }
 }

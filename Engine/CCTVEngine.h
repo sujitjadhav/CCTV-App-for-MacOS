@@ -32,6 +32,8 @@ typedef NS_ENUM(NSInteger, CCTVErrorKind) {
 - (void)start;
 - (void)stop;
 - (void)setAudioEnabled:(BOOL)on;
+/// NO = sound-only (video isn't decoded). Set before start.
+@property (nonatomic) BOOL videoEnabled;
 /// Sound volume 0…1 (when audio is enabled).
 @property (nonatomic) float volume;
 /// Recent sound level 0…1 for a level meter (0 when nothing arrives).

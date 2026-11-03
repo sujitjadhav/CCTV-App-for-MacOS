@@ -29,6 +29,7 @@ typedef struct {
     atomic_int width, height;
     _Atomic float level;        // recent audio level 0…1 (for the meter)
     _Atomic float volume;       // 0…1
+    atomic_bool noVideo;        // sound-only: receive the stream but don't decode video
 } StreamCtl;
 
 static int interruptCB(void *opaque) {
@@ -198,6 +199,8 @@ static CCTVErrorKind classify(int r, NSString **msg) {
 }
 
 - (int)takeFrameCount { return atomic_exchange(&_ctl->statFrames, 0); }
+- (BOOL)videoEnabled { return !atomic_load(&_ctl->noVideo); }
+- (void)setVideoEnabled:(BOOL)on { atomic_store(&_ctl->noVideo, !on); }
 - (float)volume { return atomic_load(&_ctl->volume); }
 - (void)setVolume:(float)v {
     atomic_store(&_ctl->volume, v);
@@ -323,7 +326,10 @@ static CCTVErrorKind classify(int r, NSString **msg) {
             if (r < 0) { err = r; break; }
             atomic_store(&_ctl->lastActivity, av_gettime_relative());
 
-            if (pkt->stream_index == vidx) {
+            if (pkt->stream_index == vidx && atomic_load(&_ctl->noVideo)) {
+                // sound-only stream: video packets are dropped undecoded (almost no CPU)
+                if (!live) { live = YES; *wasLive = YES; [self emit:CCTVStreamStateLive kind:CCTVErrorKindNone message:nil retry:0]; }
+            } else if (pkt->stream_index == vidx) {
                 if (avcodec_send_packet(vctx, pkt) >= 0) {
                     while (avcodec_receive_frame(vctx, frame) >= 0) {
                         if ([self displayFrame:frame] && !live) {

@@ -186,6 +186,14 @@ final class DVRIPClient {
         return reply["SystemInfo"] as? [String: Any] ?? [:]
     }
 
+    /// Any read-only query by name, e.g. get("StorageInfo") (msg 1020, info) or
+    /// get("NetWork.NetCommon", msg: 1042) (config). Returns reply[name].
+    func get(_ name: String, msg: UInt16 = 1020) async throws -> Any? {
+        let reply = try await call(msg) { ["Name": name, "SessionID": $0] }
+        try Self.check(reply)
+        return reply[name]
+    }
+
     /// Recordings on `channel` (0-based) that begin within from...to. Follows the NVR's
     /// 64-per-page limit by re-querying from the last item's BeginTime.
     func listFiles(channel: Int, from: Date, to: Date) async throws -> [DVRIPFile] {

@@ -500,19 +500,13 @@ struct PlayerPanel: View {
                         .monospacedDigit().foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button { rec.soundOn.toggle() } label: {
-                    Image(systemName: !rec.soundOn ? "speaker.slash.fill" : rec.speed == 1 ? "speaker.wave.2.fill" : "speaker.fill")
-                        .frame(width: 20)
-                        .foregroundStyle(rec.soundOn && rec.hasAudio && rec.speed == 1 ? Color.green : Color.primary)
+                SpeakerControl(on: rec.soundOn, available: rec.playing == nil || rec.hasAudio,
+                               volume: $rec.volume, unavailableHelp: "This recording has no sound", round: false) {
+                    rec.soundOn.toggle()
                 }
-                .disabled(rec.playing != nil && !rec.hasAudio)
-                .help(rec.playing != nil && !rec.hasAudio ? "This recording has no sound"
-                      : rec.speed != 1 ? "Sound plays at 1× speed" : rec.soundOn ? "Sound on — click to mute" : "Sound off — click to unmute")
-                Slider(value: Binding(get: { Double(rec.volume) }, set: { rec.volume = Float($0) }), in: 0...1)
-                    .controlSize(.small)
-                    .frame(width: 100)
-                    .disabled(!rec.soundOn)
-                    .help("Volume")
+                if rec.speed != 1 && rec.soundOn {
+                    Text("muted at \(Int(rec.speed))×").font(.caption).foregroundStyle(.secondary)
+                }
                 Button { rec.expanded.toggle() } label: {
                     Image(systemName: rec.expanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                         .frame(width: 18)

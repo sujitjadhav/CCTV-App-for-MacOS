@@ -19,7 +19,7 @@ final class Camera: ObservableObject, Identifiable {
     @Published var audioOn = false
     @Published var hasAudio = true              // false once we know neither stream carries sound
     @Published var volume: Float = 1 {
-        didSet { sub?.volume = volume; main?.volume = volume }
+        didSet { sub?.volume = volume; main?.volume = volume; soundOnly?.volume = volume }
     }
     var subHasAudio: Bool?                      // nil = not known yet
     var mainHasAudio: Bool?
@@ -27,6 +27,8 @@ final class Camera: ObservableObject, Identifiable {
     let video = VideoHostView()
     var sub: CCTVStream?
     var main: CCTVStream?
+    var soundOnly: CCTVStream?                  // HD stream used just for sound (grid view)
+    let soundLayer = AVSampleBufferDisplayLayer()
 
     init(channel: Int, name: String) {
         self.channel = channel
@@ -41,7 +43,7 @@ enum LiveLayout: String, CaseIterable {
 }
 
 enum AppSection: Hashable {
-    case live, recordings, events, settings
+    case live, recordings, events, device, settings
 }
 
 struct Toast: Equatable {
@@ -185,9 +187,21 @@ final class AppModel: ObservableObject {
     private func runSelfTest() {
         func log(_ s: String) { FileHandle.standardError.write("selftest: \(s)\n".data(using: .utf8)!) }
         if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "recordings" { PhaseSelfTest.run(); return }
+        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "device" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.section = .device }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 7) {
+                let d = DeviceModel.shared
+                log("device: online=\(d.online) error=\(d.error ?? "-") title=\(d.title)")
+                for (n, rows) in [("system", d.system), ("device", d.device), ("network", d.network), ("recording", d.recording + d.general)] {
+                    log("\(n): " + rows.map { "\($0.label)=\($0.value)" }.joined(separator: " | "))
+                }
+                for k in d.disks { log("disk \(k.id): total=\(DeviceModel.size(mb: k.totalMB)) used=\(DeviceModel.size(mb: k.usedMB)) \(Int(k.fraction * 100))% \(k.status)") }
+            }
+            return
+        }
         if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "audio" {
             let c = self.cameras[0]
-            func st() -> String { "sub=\(String(describing: c.subHasAudio)) main=\(String(describing: c.mainHasAudio)) hasAudio=\(c.hasAudio) level=\(String(format: "%.3f", self.audioLevel(c)))" }
+            func st() -> String { "sub=\(String(describing: c.subHasAudio)) main=\(String(describing: c.mainHasAudio)) hasAudio=\(c.hasAudio) soundOnly=\(c.soundOnly != nil) hdVideo=\(c.main != nil) level=\(String(format: "%.3f", self.audioLevel(c)))" }
             let steps: [(Double, () -> Void)] = [
                 (4, { self.layout = .grid; self.focus(nil); self.setAudio(true, for: c) }),
                 (8, { log("grid, sound on: \(st())"); self.focus(0) }),
@@ -251,6 +265,7 @@ final class AppModel: ObservableObject {
         for cam in cameras {
             cam.sub?.stop(); cam.sub = nil
             if cam.main != nil { stopMain(cam) }
+            cam.soundOnly?.stop(); cam.soundOnly = nil
             cam.status = .idle("Paused")
         }
     }
@@ -325,6 +340,7 @@ final class AppModel: ObservableObject {
         for cam in cameras {
             cam.sub?.stop()
             cam.main?.stop()
+            cam.soundOnly?.stop()
         }
     }
 
@@ -474,17 +490,36 @@ final class AppModel: ObservableObject {
 
     /// Sound comes from the stream you're watching: the HD stream when it's showing and has sound
     /// (XMEye NVRs often send audio only on the main stream), otherwise the substream.
+    /// In the grid, a substream without sound falls back to a sound-only HD stream (video not decoded).
     func routeAudio(_ cam: Camera) {
         let mainOK = cam.main != nil && cam.mainHasAudio == true
         let useMain = mainOK && (cam.video.showsMain || cam.subHasAudio == false)
         cam.sub?.setAudioEnabled(cam.audioOn && !useMain)
         cam.main?.setAudioEnabled(cam.audioOn && useMain)
+
+        let needSoundOnly = cam.audioOn && liveActive && cam.main == nil && cam.subHasAudio == false && cam.mainHasAudio != false
+        if needSoundOnly && cam.soundOnly == nil, let url = streamURL(channel: cam.channel, main: true) {
+            let s = CCTVStream(url: url, layer: cam.soundLayer)
+            s.videoEnabled = false
+            s.volume = cam.volume
+            s.onAudioAvailable = { [weak self, weak cam, weak s] has in
+                guard let cam, cam.soundOnly === s else { return }
+                cam.mainHasAudio = has
+                self?.routeAudio(cam)
+            }
+            s.setAudioEnabled(true)
+            cam.soundOnly = s
+            s.start()
+        } else if !needSoundOnly, let s = cam.soundOnly {
+            s.stop()
+            cam.soundOnly = nil
+        }
         cam.hasAudio = cam.subHasAudio != false || cam.mainHasAudio != false
     }
 
     /// Current sound level of a camera (0…1) for the meter.
     func audioLevel(_ cam: Camera) -> Float {
-        max(cam.sub?.audioLevel ?? 0, cam.main?.audioLevel ?? 0)
+        max(cam.sub?.audioLevel ?? 0, cam.main?.audioLevel ?? 0, cam.soundOnly?.audioLevel ?? 0)
     }
 
     func setVolume(_ v: Float, for cam: Camera) {

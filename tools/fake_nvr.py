@@ -128,6 +128,18 @@ def xmeye_file(frames, audio, begin, codec="h264"):
 
 # ---------- server ----------
 
+FAKE_INFO = {
+    "StorageInfo": [{"PartNumber": 1, "PlysicalNo": 0, "Partition": [
+        {"DirverType": 0, "IsCurrent": True, "LogicSerialNo": 0, "NewEndTime": "2026-11-04 00:00:00",
+         "NewStartTime": "2026-10-20 00:00:00", "RemainSpace": "0x00195C00", "Status": 0, "TotalSpace": "0x001D1A94"}]}],
+    "General.General": {"AutoLogout": 0, "LocalNo": 0, "MachineName": "Home", "OverWrite": "OverWrite", "VideoOutPut": "Auto"},
+    "NetWork.NetCommon": {"GateWay": "0x0101A8C0", "HostIP": "0x5201A8C0", "HostName": "LocalHost", "HttpPort": 80,
+                          "MAC": "d4:61:37:00:00:01", "Submask": "0x00FFFFFF", "TCPPort": 34567, "UDPPort": 34568},
+    "NetWork.NetDHCP": [{"Enable": True, "Interface": "eth0"}],
+    "Record": [{"PacketLength": 60, "PreRecord": 5, "RecordMode": "ConfigRecord", "Redundancy": False}],
+    "Status.NatInfo": {"NatStatus": "Conneted", "InfoState": "", "SerialNo": "fake0000000000"},
+}
+
 class Recordings:
     def __init__(self, frames, audio, day):
         self.frames, self.audio = frames, audio
@@ -227,6 +239,8 @@ class Conn(threading.Thread):
             self.reply(msg + 1, {"Name": "SystemInfo", "Ret": 100, "SessionID": self.sid(), "SystemInfo": {
                 "HardWare": "FAKE-NVR", "SoftWareVersion": "V4.03.R11.fake", "VideoInChannel": 4,
                 "SerialNo": "fake0000000000"}})
+        elif msg in (1020, 1042) and name in FAKE_INFO:
+            self.reply(msg + 1, {"Name": name, "Ret": 100, "SessionID": self.sid(), name: FAKE_INFO[name]})
         elif msg == 1452:
             now = datetime.now(IST).strftime(FMT)
             self.reply(1453, {"Name": "OPTimeQuery", "OPTimeQuery": now, "Ret": 100, "SessionID": self.sid()})
