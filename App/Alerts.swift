@@ -12,14 +12,41 @@ struct AlertEvent: Codable, Identifiable, Hashable {
     let time: Date
     var notified: Bool
 
-    var title: String {
-        switch event {
+    var title: String { AlertEvent.title(for: event) }
+    var icon: String { AlertEvent.icon(for: event) }
+
+    /// Friendly names for XMEye event codes (e.g. "appEventHumanDetectAlarm" → "Person detected").
+    static func title(for code: String) -> String {
+        let c = code.lowercased()
+        if c.contains("face") { return "Face detected" }
+        if c.contains("human") || c.contains("person") || c.contains("ped") { return "Person detected" }
+        if c.contains("vehicle") || c.contains("car") { return "Vehicle detected" }
+        switch code {
         case "VideoMotion": return "Motion"
-        case "VideoBlind": return "Camera blocked"
+        case "VideoBlind": return "Camera covered"
         case "VideoLoss": return "Video lost"
-        case "HumanDetect", "HumanDetection": return "Person detected"
-        case "LocalAlarm", "NetAlarm": return "Alarm"
-        default: return event
+        case "LocalAlarm", "NetAlarm": return "Alarm input"
+        case "StorageFailure", "StorageNotExist", "StorageLowSpace": return "Disk problem"
+        default:
+            // appEventSomethingAlarm → "Something"
+            var t = code
+            if t.hasPrefix("appEvent") { t.removeFirst(8) }
+            if t.hasSuffix("Alarm") { t.removeLast(5) }
+            let spaced = t.replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression)
+            return spaced.isEmpty ? code : spaced.prefix(1).uppercased() + spaced.dropFirst().lowercased()
+        }
+    }
+
+    static func icon(for code: String) -> String {
+        switch title(for: code) {
+        case "Face detected": return "face.smiling"
+        case "Person detected": return "figure.walk"
+        case "Vehicle detected": return "car.fill"
+        case "Motion": return "dot.radiowaves.left.and.right"
+        case "Video lost": return "video.slash.fill"
+        case "Camera covered": return "eye.slash.fill"
+        case "Disk problem": return "externaldrive.badge.exclamationmark"
+        default: return "bell.fill"
         }
     }
 }
@@ -184,48 +211,130 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
 struct EventsView: View {
     @EnvironmentObject var app: AppModel
     @ObservedObject var alerts = AlertCenter.shared
+    @ObservedObject var rec = RecordingsModel.shared
     @State private var cameraFilter = -1
+    @State private var typeFilter = ""          // "" = all types
+    @State private var selection: AlertEvent.ID?
+
+    private var filtered: [AlertEvent] {
+        alerts.events.filter { (cameraFilter < 0 || $0.channel == cameraFilter) && (typeFilter.isEmpty || $0.title == typeFilter) }
+    }
+    private var selected: AlertEvent? { selection.flatMap { id in alerts.events.first { $0.id == id } } }
 
     var body: some View {
-        let f: DateFormatter = { let f = DateFormatter(); f.dateFormat = "d MMM, HH:mm:ss"; return f }()
-        VStack(spacing: 0) {
-            HStack {
-                Picker("Camera", selection: $cameraFilter) {
-                    Text("All cameras").tag(-1)
-                    ForEach(app.cameras.indices, id: \.self) { i in Text(app.cameras[i].displayName).tag(i) }
-                }
-                .frame(width: 220)
-                Spacer()
-                Label(alerts.connected ? "Listening for NVR alerts" : (alerts.enabled ? "Not connected to NVR alerts" : "Alerts are off"),
-                      systemImage: alerts.connected ? "bell.badge.fill" : "bell.slash")
-                    .foregroundStyle(alerts.connected ? .green : .secondary)
-                    .help(alerts.lastError ?? "")
-                Button("Clear Log") { alerts.clearLog() }.disabled(alerts.events.isEmpty)
-            }
-            .padding(12)
-            let list = alerts.events.filter { cameraFilter < 0 || $0.channel == cameraFilter }
-            if list.isEmpty {
-                Spacer()
-                Text("No alerts yet").foregroundStyle(.secondary)
-                Spacer()
-            } else {
-                Table(list) {
-                    TableColumn("Time") { e in Text(f.string(from: e.time)).monospacedDigit() }.width(140)
-                    TableColumn("Camera") { e in Text(e.channel < app.cameras.count ? app.cameras[e.channel].displayName : "Camera \(e.channel + 1)") }
-                    TableColumn("Event") { e in
-                        Label(e.title, systemImage: e.notified ? "bell.fill" : "bell.slash").labelStyle(.titleAndIcon)
-                            .help(e.notified ? "Notified" : "Not notified (camera alerts off or quiet hours)")
-                    }
-                    TableColumn("") { e in
-                        Button("Play Recording") {
-                            RecordingsModel.shared.open(channel: e.channel, at: e.time.addingTimeInterval(-10))
-                        }
-                    }.width(130)
+        HSplitView {
+            VStack(spacing: 0) {
+                toolbar
+                if filtered.isEmpty {
+                    Spacer()
+                    Text(alerts.events.isEmpty ? "No alerts yet" : "No alerts match the filters").foregroundStyle(.secondary)
+                    Spacer()
+                } else {
+                    table
                 }
             }
+            .frame(minWidth: 460, idealWidth: 560)
+
+            preview
+                .frame(minWidth: 420)
         }
         .navigationTitle("Events")
         .onAppear { alerts.unseen = 0 }
+        .onDisappear { if app.section != .recordings { rec.releaseMemory() } }
+        .onChange(of: selection) { _, _ in if let e = selected { watch(e) } }
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 10) {
+            Picker("Camera", selection: $cameraFilter) {
+                Text("All cameras").tag(-1)
+                ForEach(app.cameras.indices, id: \.self) { i in Text(app.cameras[i].displayName).tag(i) }
+            }
+            .labelsHidden()
+            .frame(width: 150)
+            Picker("Type", selection: $typeFilter) {
+                Text("All events").tag("")
+                ForEach(Array(Set(alerts.events.map(\.title))).sorted(), id: \.self) { t in Text(t).tag(t) }
+            }
+            .labelsHidden()
+            .frame(width: 160)
+            Text("\(filtered.count) alert\(filtered.count == 1 ? "" : "s")").font(.callout).foregroundStyle(.secondary)
+            Spacer()
+            Image(systemName: alerts.connected ? "bell.badge.fill" : "bell.slash")
+                .foregroundStyle(alerts.connected ? .green : .secondary)
+                .help(alerts.connected ? "Listening for NVR alerts" : (alerts.lastError ?? (alerts.enabled ? "Not connected to NVR alerts" : "Alerts are off")))
+            Button("Clear Log") { alerts.clearLog(); selection = nil }.disabled(alerts.events.isEmpty)
+        }
+        .padding(12)
+    }
+
+    private var table: some View {
+        let f: DateFormatter = { let f = DateFormatter(); f.dateFormat = "d MMM, HH:mm:ss"; return f }()
+        return Table(filtered, selection: $selection) {
+            TableColumn("Time") { e in Text(f.string(from: e.time)).monospacedDigit() }.width(min: 110, ideal: 130)
+            TableColumn("Camera") { e in Text(cameraName(e.channel)) }.width(min: 80, ideal: 120)
+            TableColumn("Event") { e in
+                HStack(spacing: 6) {
+                    Image(systemName: e.icon).foregroundStyle(Color.accentColor).frame(width: 18)
+                    Text(e.title)
+                    if !e.notified {
+                        Image(systemName: "bell.slash").foregroundStyle(.secondary)
+                            .help("Not notified (camera alerts off, quiet hours, or repeated within a minute)")
+                    }
+                }
+            }
+        }
+        .contextMenu(forSelectionType: AlertEvent.ID.self) { ids in
+            if let id = ids.first, let e = alerts.events.first(where: { $0.id == id }) {
+                Button("Play Here") { selection = id; watch(e) }
+                Button("Open in Recordings") { RecordingsModel.shared.open(channel: e.channel, at: e.time.addingTimeInterval(-10)) }
+                Button("Watch Live") { app.section = .live; app.focus(e.channel) }
+            }
+        } primaryAction: { ids in
+            if let id = ids.first, let e = alerts.events.first(where: { $0.id == id }) {
+                RecordingsModel.shared.open(channel: e.channel, at: e.time.addingTimeInterval(-10))
+            }
+        }
+    }
+
+    @ViewBuilder private var preview: some View {
+        if let e = selected {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: e.icon).font(.title3).foregroundStyle(Color.accentColor)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(e.title) · \(cameraName(e.channel))").font(.headline)
+                        Text(e.time.formatted(date: .abbreviated, time: .standard)).font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button { app.section = .live; app.focus(e.channel) } label: { Label("Live", systemImage: "video.fill") }
+                    Button { RecordingsModel.shared.open(channel: e.channel, at: e.time.addingTimeInterval(-10)) } label: {
+                        Label("Open in Recordings", systemImage: "film.stack")
+                    }
+                }
+                .padding(12)
+                PlayerPanel(rec: rec)
+            }
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "play.rectangle").font(.system(size: 40, weight: .light)).foregroundStyle(.secondary)
+                Text("Click an alert to watch it").font(.title3.weight(.semibold))
+                Text("The recording plays from 10 seconds before the alert,\nstraight from the NVR.")
+                    .multilineTextAlignment(.center).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func cameraName(_ ch: Int) -> String {
+        ch >= 0 && ch < app.cameras.count ? app.cameras[ch].displayName : "Camera \(ch + 1)"
+    }
+
+    /// Plays the NVR recording around the alert inside the Events screen.
+    private func watch(_ e: AlertEvent) {
+        rec.channel = e.channel
+        rec.day = e.time
+        rec.load(thenPlay: e.time.addingTimeInterval(-10))
     }
 }
 

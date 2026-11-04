@@ -117,7 +117,10 @@ final class AppModel: ObservableObject {
         // Test runs (fake NVR / local feeds) never touch the real Keychain password.
         let env = ProcessInfo.processInfo.environment
         let testing = env["CCTV_FAKE_NVR"] != nil || env["CCTV_TEST_URL"] != nil
-        password = testing ? "" : (Keychain.password(for: keychainAccount) ?? "")
+        // The Keychain is read in start(), off the main thread: macOS may show an "allow" prompt
+        // (after an update) and the window must be able to open meanwhile.
+        password = ""
+        passwordLoaded = testing
         let vols = defaults.array(forKey: "cameraVolumes") as? [Double] ?? []
         for (i, v) in vols.enumerated() where i < cameras.count { cameras[i].volume = Float(v) }
     }
@@ -160,15 +163,28 @@ final class AppModel: ObservableObject {
 
     // MARK: Lifecycle
 
+    /// True once the saved password has been read from the Keychain.
+    @Published private(set) var passwordLoaded = false
+
     func start() {
         checkLocalNetwork()
-        if !isConfigured {
-            settingsMessage = nil
-            section = .settings
-        }
         started = true
         installObservers()
-        updateLiveActive()
+        if passwordLoaded {
+            finishStartup()
+        } else {
+            for cam in cameras { cam.status = .idle("Waiting for Keychain access…\nIf macOS asks, click Always Allow") }
+            let account = keychainAccount
+            DispatchQueue.global(qos: .userInitiated).async {
+                let pw = Keychain.password(for: account) ?? ""
+                DispatchQueue.main.async {
+                    self.password = pw
+                    self.passwordLoaded = true
+                    self.finishStartup()
+                    AlertCenter.shared.restart()
+                }
+            }
+        }
         if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] != nil { runSelfTest() }
         if ProcessInfo.processInfo.environment["CCTV_STATS"] != nil {
             statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -187,6 +203,28 @@ final class AppModel: ObservableObject {
     private func runSelfTest() {
         func log(_ s: String) { FileHandle.standardError.write("selftest: \(s)\n".data(using: .utf8)!) }
         if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "recordings" { PhaseSelfTest.run(); return }
+        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "events" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.section = .events }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                func walk(_ v: NSView, _ depth: Int = 0) {
+                    if let t = v as? NSTableView {
+                        log("table: rows=\(t.numberOfRows) cols=\(t.numberOfColumns) frame=\(t.frame) visible=\(t.visibleRect)")
+                    }
+                    if let sv = v as? NSScrollView { log("scrollview frame=\(sv.frame) hidden=\(sv.isHidden)") }
+                    for c in v.subviews { walk(c, depth + 1) }
+                }
+                log("events in model: \(AlertCenter.shared.events.count)")
+                if let out = ProcessInfo.processInfo.environment["CCTV_SNAPSHOT"],
+                   let w = NSApp.windows.first(where: { $0.isVisible && $0.frame.width > 200 }), let v = w.contentView,
+                   let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+                    log("window image written")
+                }
+                for w in NSApp.windows where w.isVisible { log("window \(w.frame)"); if let cv = w.contentView { walk(cv) } }
+            }
+            return
+        }
         if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "device" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.section = .device }
             DispatchQueue.main.asyncAfter(deadline: .now() + 7) {
@@ -253,8 +291,16 @@ final class AppModel: ObservableObject {
 
     private(set) var liveActive = false
 
+    private func finishStartup() {
+        if !isConfigured {
+            settingsMessage = nil
+            section = .settings
+        }
+        updateLiveActive()
+    }
+
     private func updateLiveActive() {
-        guard started else { return }
+        guard started, passwordLoaded else { return }
         let on = section == .live && windowVisible && !asleep
         guard on != liveActive else { return }
         liveActive = on

@@ -571,6 +571,9 @@ struct SettingsView: View {
             pass = model.currentPassword
             names = model.cameras.map(\.name)
         }
+        .onChange(of: model.passwordLoaded) { _, loaded in
+            if loaded && pass.isEmpty { pass = model.currentPassword }
+        }
     }
 
     private var current: NVRSettings {
