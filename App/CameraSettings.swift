@@ -92,7 +92,7 @@ enum JSONValue {
 // MARK: - Which configs make up a camera's settings
 
 enum CamDoc: String, CaseIterable, Identifiable {
-    case param, paramEx, whiteLight, color, fog, encode, widget, motion, human, blind, loss, record
+    case param, paramEx, whiteLight, color, fog, encode, smart, widget, motion, human, blind, loss, record
     var id: String { rawValue }
 
     var label: String {
@@ -103,6 +103,7 @@ enum CamDoc: String, CaseIterable, Identifiable {
         case .color: return "Picture colour"
         case .fog: return "Defog"
         case .encode: return "Video quality"
+        case .smart: return "Smart encoding"
         case .widget: return "Overlay & privacy masks"
         case .motion: return "Motion detection"
         case .human: return "Person detection"
@@ -122,6 +123,7 @@ enum CamDoc: String, CaseIterable, Identifiable {
         case .color: return [("AVEnc.VideoColor.[\(ch)]", nil)]
         case .fog: return [("Camera.ClearFog.[\(ch)]", nil)]
         case .encode: return [("Simplify.Encode", ch), ("Simplify.Encode.[\(ch)]", nil)]
+        case .smart: return [("AVEnc.SmartH264V2.[\(ch)]", nil)]
         case .widget: return [("AVEnc.VideoWidget.[\(ch)]", nil), ("AVEnc.VideoWidget", ch)]
         case .motion: return [("Detect.MotionDetect.[\(ch)]", nil), ("Detect.MotionDetect", ch)]
         case .human: return [("Detect.HumanDetection.[\(ch)]", nil)]
@@ -135,6 +137,7 @@ enum CamDoc: String, CaseIterable, Identifiable {
 struct ResolvedDoc {
     let name: String
     let prefix: [String]      // path from the reply to this channel's object ([] / ["0"] / ["3"])
+    var onCamera = false      // read from the IP camera itself, not the NVR
 }
 
 struct ModeOption: Hashable, Identifiable {
@@ -273,6 +276,8 @@ final class CameraSettingsModel: ObservableObject {
     private var pending: [CamDoc: DispatchWorkItem] = [:]
     private var chain: Task<Void, Never>?
     private var conn: DVRIPClient?
+    private var camConn: DVRIPClient?                 // direct login to an IP camera behind the NVR
+    @Published private(set) var cameraInfo: String?   // e.g. "3.0MP Securus HS-UTL Cam · 192.168.1.13"
 
     init(channel: Int) { self.channel = channel }
 
@@ -325,14 +330,15 @@ final class CameraSettingsModel: ObservableObject {
         guard let root = roots[d], let res = resolved[d] else { return }
         saving += 1
         enqueue({ c in
-            try await c.set(res.name, root)
+            let target = res.onCamera ? (self.camConn ?? c) : c
+            try await target.set(res.name, root)
             self.confirmed[d] = root
             self.savedAt = Date()
             self.saving -= 1
         }, failed: { e in
             self.saving -= 1
             if self.pending[d] == nil, let old = self.confirmed[d] { self.roots[d] = old; self.generation += 1 }
-            self.error = "\(d.label): the NVR didn't accept the change (\(e.localizedDescription))"
+            self.error = "\(d.label): the \(res.onCamera ? "camera" : "NVR") didn't accept the change (\(e.localizedDescription))"
         })
     }
 
@@ -359,7 +365,41 @@ final class CameraSettingsModel: ObservableObject {
             await prev?.value
             self.conn?.close()
             self.conn = nil
+            self.camConn?.close()
+            self.camConn = nil
         }
+    }
+
+    /// An NVR doesn't pass every setting through to its IP cameras (video quality, for one). The NVR does
+    /// know each camera's address and login (NetWork.RemoteDeviceV3), so log in to the camera directly.
+    /// The login stays in memory and is never shown or logged.
+    private func openCamera(_ nvr: DVRIPClient) async -> DVRIPClient? {
+        if let c = camConn { return c }
+        guard let v = try? await nvr.get("NetWork.RemoteDeviceV3.[\(channel)]", msg: 1042) as? [String: Any],
+              JSONValue.truthy(v["Enable"]),
+              let dec = (v["Decoder"] as? [[String: Any]])?.first,
+              let ip = (dec["IPAddress"] as? String)?.trimmingCharacters(in: .whitespaces), !ip.isEmpty, ip != "0.0.0.0"
+        else { return nil }
+        let port = Int(JSONValue.number(dec["Port"]) ?? 34567)
+        let user = (dec["UserName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "admin"
+        // The password the NVR uses for this camera first, then the NVR's own (often the same). Two tries
+        // at most, so a camera that locks out after failed logins isn't locked.
+        var passwords = [dec["PassWord"] as? String ?? ""]
+        if let nvrPassword = AppModel.shared.dvripSettings?.password, !passwords.contains(nvrPassword) { passwords.append(nvrPassword) }
+        for pw in passwords {
+            let cam = DVRIPClient(host: ip, port: port, username: user, password: pw, timeZone: AppModel.shared.nvrTimeZone)
+            do {
+                try await cam.login()
+                camConn = cam
+                let model = (dec["ConfName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "IP camera"
+                cameraInfo = "\(model) · \(ip)"
+                return cam
+            } catch {
+                cam.close()
+                if (error as? DVRIPError) != .wrongPassword { break }   // only a wrong password is worth a second try
+            }
+        }
+        return nil
     }
 
     // MARK: Loading
@@ -384,6 +424,14 @@ final class CameraSettingsModel: ObservableObject {
             var roots: [CamDoc: Any] = [:], res: [CamDoc: ResolvedDoc] = [:]
             for d in CamDoc.allCases {
                 if let (r, v) = await Self.resolve(d, ch: self.channel, client: c) { roots[d] = v; res[d] = r }
+            }
+            // Video quality of an IP camera: ask the camera itself (it is channel 0 on its own).
+            if roots[.encode] == nil, let cam = await self.openCamera(c),
+               let (r, v) = await Self.resolve(.encode, ch: 0, client: cam) {
+                var r2 = r
+                r2.onCamera = true
+                roots[.encode] = v
+                res[.encode] = r2
             }
             let titles = (try? await c.get("ChannelTitle", msg: 1048)) as? [String]
             self.resolved = res
@@ -973,7 +1021,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .image: return [.param, .paramEx, .color, .fog]
         case .dayNight: return [.param, .paramEx, .whiteLight]
-        case .video: return [.encode]
+        case .video: return [.encode, .smart]
         case .overlay: return [.widget]
         case .detection: return [.motion, .human, .blind, .loss]
         case .recording: return [.record]
@@ -1263,8 +1311,27 @@ struct VideoTab: View {
 
     var body: some View {
         Form {
+            if m.resolved[.encode]?.onCamera == true, let info = m.cameraInfo {
+                Section {
+                    Label("Read directly from the camera (\(info)), because the NVR doesn't pass video settings through.",
+                          systemImage: "point.3.connected.trianglepath.dotted")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
             stream("MainFormat", "Main stream · HD", "Used for full-size view and recordings.")
             stream("ExtraFormat", "Sub stream · grid", "Used for the camera grid and the menu bar previews.")
+            if m.has(.smart) {
+                Section {
+                    FlagRow(m, .smart, "Smart264PlusV2.0.SmartH264Plus", "H.264+ / H.265+ · main stream",
+                            help: "Much smaller recordings for mostly still scenes.")
+                    FlagRow(m, .smart, "Smart264V2.0.SmartH264", "Smart encoding · main stream",
+                            help: "Lowers the bitrate when nothing moves.")
+                    FlagRow(m, .smart, "Smart264PlusV2.1.SmartH264Plus", "H.264+ / H.265+ · sub stream")
+                    FlagRow(m, .smart, "Smart264V2.1.SmartH264", "Smart encoding · sub stream")
+                } header: { Text("Smart encoding") } footer: {
+                    Text("Saves disk space on the NVR so it keeps more days of recordings.")
+                }
+            }
             Section {
                 Text("After a change the camera restarts its stream, so the picture may freeze for a few seconds. Settings the camera can't do are refused by the NVR and put back.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -1514,7 +1581,7 @@ struct AdvancedTab: View {
         ("image", "Image, exposure & day/night", [.param, .paramEx, .color, .fog, .whiteLight]),
         ("detect", "Motion, person & tamper detection", [.motion, .human, .blind, .loss]),
         ("record", "Recording mode & schedule", [.record]),
-        ("video", "Video quality", [.encode]),
+        ("video", "Video quality & smart encoding", [.encode, .smart]),
     ]
 
     var body: some View {
@@ -1565,7 +1632,7 @@ struct AdvancedTab: View {
                 HStack {
                     Picker("Config", selection: $rawName) {
                         Text("Choose…").tag("")
-                        ForEach(CamDoc.allCases.filter { m.has($0) }) { d in
+                        ForEach(CamDoc.allCases.filter { m.has($0) && m.resolved[$0]?.onCamera != true }) { d in
                             Text("\(d.label) · \(m.resolved[d]?.name ?? "")").tag(m.resolved[d]?.name ?? d.rawValue)
                         }
                     }
@@ -1731,8 +1798,73 @@ enum CameraSettingsSelfTest {
         }
     }
 
+    /// Removes anything that looks like a password before logging a reply.
+    static func redact(_ v: Any) -> Any {
+        if let d = v as? [String: Any] {
+            return Dictionary(uniqueKeysWithValues: d.map { k, x in (k, k.lowercased().contains("pass") ? "<hidden>" : redact(x)) })
+        }
+        if let a = v as? [Any] { return a.map(redact) }
+        return v
+    }
+
+    /// CCTV_PROBE=names: read-only. Asks the NVR for many config names for channel CCTV_PROBE_CH and logs
+    /// which ones it answers (passwords removed), to find the names a given NVR model uses.
+    static func probeNames(ch: Int) {
+        let names: [(String, UInt16)] = [
+            ("Simplify.Encode", 1042), ("Simplify.Encode.[\(ch)]", 1042), ("Simplify.Encode", 1020),
+            ("AVEnc.Encode", 1042), ("AVEnc.Encode.[\(ch)]", 1042), ("Encode", 1042), ("ExtEncode", 1042),
+            ("AVEnc.EncodeStaticParam", 1042), ("AVEnc.EncodeStaticParam.[\(ch)]", 1042),
+            ("AVEnc.SmartH264V2.[\(ch)]", 1042), ("AVEnc.SmartH264.[\(ch)]", 1042), ("AVEnc.CombineEncode", 1042),
+            ("AVEnc.EncodeEx", 1042), ("AVEnc.EncodeEx.[\(ch)]", 1042), ("NetWork.RemoteChnEncode", 1042),
+            ("NetWork.RemoteChnEncode.[\(ch)]", 1042), ("NetWork.DigManagerShow", 1042), ("NetWork.RemoteDeviceV3", 1042),
+            ("NetWork.RemoteDeviceV3.[\(ch)]", 1042), ("Ability.EncodeCapability", 1042),
+            ("EncodeCapability", 1360), ("SystemFunction", 1360), ("ChannelSystemFunction", 1360),
+            ("Camera.Param.[\(ch)]", 1042), ("AVEnc.VideoWidget.[\(ch)]", 1042), ("Record.[\(ch)]", 1042),
+        ]
+        Task { @MainActor in
+            // The password comes from the Keychain in the background (and may wait for the user's OK).
+            for _ in 0..<150 where AppModel.shared.dvripSettings == nil { try? await Task.sleep(nanoseconds: 1_000_000_000) }
+            let c: DVRIPClient
+            do { c = try await DVRIPClient.connected() } catch { log("probe: can't log in: \(error.localizedDescription)"); return }
+            defer { c.close() }
+            log("probe: channels=\(c.channelCount)")
+            for (name, msg) in names {
+                do {
+                    let v = try await c.get(name, msg: msg)
+                    let shown = v.map { JSONValue.pretty(redact($0)).replacingOccurrences(of: "\n", with: " ") } ?? "nil"
+                    log("probe OK  \(msg) \(name): \(shown.prefix(700))")
+                } catch {
+                    log("probe ERR \(msg) \(name): \(error.localizedDescription)")
+                }
+            }
+            log("probe done")
+        }
+    }
+
+    /// CCTV_PROBE=settings: read-only. Loads the settings window's data for channel CCTV_PROBE_CH and logs it.
+    static func probeSettings(ch: Int) {
+        let m = CameraSettingsModel(channel: ch)
+        Task { @MainActor in
+            for _ in 0..<150 where AppModel.shared.dvripSettings == nil { try? await Task.sleep(nanoseconds: 1_000_000_000) }
+            m.load {
+                log("probe settings ch\(ch): " + CamDoc.allCases.map { d in
+                    "\(d.rawValue)=\(m.resolved[d].map { "\($0.name)\($0.onCamera ? "@camera" : "")" } ?? "-")"
+                }.joined(separator: " "))
+                log("probe camera: \(m.cameraInfo ?? "-") error=\(m.error ?? "-")")
+                for k in ["MainFormat", "ExtraFormat"] {
+                    log("probe \(k): \(JSONValue.pretty(m.value(.encode, k)).replacingOccurrences(of: "\n", with: " ").prefix(600))")
+                }
+                log("probe smart: \(JSONValue.pretty(m.element(.smart)).replacingOccurrences(of: "\n", with: " ").prefix(300))")
+                m.close()
+                log("probe done")
+            }
+        }
+    }
+
     static func probe() {
         let ch = Int(ProcessInfo.processInfo.environment["CCTV_PROBE_CH"] ?? "0") ?? 0
+        if ProcessInfo.processInfo.environment["CCTV_PROBE"] == "names" { return probeNames(ch: ch) }
+        if ProcessInfo.processInfo.environment["CCTV_PROBE"] == "settings" { return probeSettings(ch: ch) }
         var last = ""
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
             Task { @MainActor in

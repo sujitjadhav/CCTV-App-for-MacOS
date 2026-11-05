@@ -186,6 +186,8 @@ def default_cfg(name):
                 "Covers": [{"BackColor": "0x00000000", "EncodeBlend": False, "FrontColor": "0x00000000",
                             "PreviewBlend": False, "RelativePos": [0, 0, 0, 0]} for _ in range(4)],
                 "CoversNum": 4, "TimeTitleAttribute": dict(title, RelativePos=[0, 0, 0, 0])}
+    if name.startswith("AVEnc.SmartH264V2.["):
+        return {"Smart264PlusV2": [{"SmartH264Plus": 0}, {"SmartH264Plus": 0}], "Smart264V2": [{"SmartH264": False}, {"SmartH264": False}]}
     if name.startswith("Detect.MotionDetect.["):
         return {"Enable": True, "EventHandler": _handler(), "Level": 3, "Region": ["0x003FFFFF"] * 18}
     if name.startswith("Detect.HumanDetection.["):
@@ -299,6 +301,13 @@ class Conn(threading.Thread):
             self.reply(msg + 1, {"Name": "SystemInfo", "Ret": 100, "SessionID": self.sid(), "SystemInfo": {
                 "HardWare": "FAKE-NVR", "SoftWareVersion": "V4.03.R11.fake", "VideoInChannel": 4,
                 "SerialNo": "fake0000000000"}})
+        elif msg == 1042 and self.args.no_encode and name.startswith("Simplify.Encode"):
+            self.reply(1043, {"Name": name, "Ret": 607, "SessionID": self.sid()})   # like an NVR with IP cameras
+        elif msg == 1042 and name.startswith("NetWork.RemoteDeviceV3.["):
+            self.reply(1043, {"Name": name, "Ret": 100, "SessionID": self.sid(), name: {
+                "ConnType": "SINGLE", "Enable": True, "Decoder": [{
+                    "Channel": 0, "ConfName": "Fake IP Cam", "DevType": "IPC", "Enable": True, "IPAddress": "127.0.0.1",
+                    "PassWord": self.args.camera_password, "Port": self.args.camera_port or self.args.port, "UserName": "admin"}]}})
         elif msg == 1042 and (name in CAMERA_CFG or default_cfg(name) is not None):
             if name not in CAMERA_CFG:
                 CAMERA_CFG[name] = default_cfg(name)
@@ -389,6 +398,9 @@ def main():
     ap.add_argument("--port", type=int, default=34568)
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", default="")
+    ap.add_argument("--no-encode", action="store_true", help="refuse Simplify.Encode, like an NVR with IP cameras")
+    ap.add_argument("--camera-port", type=int, default=0, help="port of the 'IP camera' in NetWork.RemoteDeviceV3")
+    ap.add_argument("--camera-password", default="", help="password the NVR reports for its IP camera")
     ap.add_argument("--alive", type=int, default=2, help="AliveInterval sent at login (s)")
     ap.add_argument("--alarm-interval", type=float, default=1.0)
     ap.add_argument("--chunk-delay", type=float, default=0.005, help="pause between 32 KB download chunks (s)")
