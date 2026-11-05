@@ -153,11 +153,15 @@ enum CameraModes {
     ]
     static let lightExtra: [String: String] = ["Intelligent": "Smart", "Atmosphere": "Atmosphere"]
 
-    /// Day/night ("DayNightColor"). Codes learned from a camera are added from `learned()`.
+    /// Day/night ("DayNightColor"), in the XMEye phone app's order: codes 0–5 confirmed on a real
+    /// Securus camera (5 = Smart Exir, 3 = HumanSense). Other codes can be named via `learned()`.
     static let dayNight: [ModeOption] = [
-        ModeOption(value: "0", label: "Auto"),
+        ModeOption(value: "0", label: "Star IR"),
         ModeOption(value: "1", label: "Full Color"),
         ModeOption(value: "2", label: "Black & White"),
+        ModeOption(value: "3", label: "HumanSense"),
+        ModeOption(value: "4", label: "ColorSense"),
+        ModeOption(value: "5", label: "Smart Exir"),
     ]
 
     /// Names for other DayNightColor codes, saved when the user names them (keys as JSONValue.key).
@@ -478,6 +482,37 @@ final class CameraSettingsModel: ObservableObject {
             done(nil)
             self.load()
         }, failed: { done($0) })
+    }
+}
+
+// MARK: - Quick changes from a camera's right-click menu
+
+enum QuickCameraSettings {
+    static func setDayNight(_ o: ModeOption, camera: Camera) {
+        apply(.param, "DayNightColor", camera: camera, done: "\(camera.displayName): \(o.label)") { JSONValue.option(o.value, like: $0) }
+    }
+
+    static func setLight(_ o: ModeOption, camera: Camera) {
+        apply(.whiteLight, "WorkMode", camera: camera, done: "\(camera.displayName): light \(o.label)") { _ in o.value }
+    }
+
+    /// Reads the camera's own object, changes one field and writes it back.
+    private static func apply(_ d: CamDoc, _ path: String, camera: Camera, done: String, value: @escaping (Any?) -> Any) {
+        let ch = camera.channel - 1
+        Task { @MainActor in
+            do {
+                let c = try await DVRIPClient.connected()
+                defer { c.close() }
+                guard let (res, root) = await CameraSettingsModel.resolve(d, ch: ch, client: c) else {
+                    throw DVRIPError.protocolError("this camera doesn't report that setting")
+                }
+                let full = res.prefix + JSONValue.path(path)
+                try await c.set(res.name, JSONValue.set(root, ArraySlice(full), value(JSONValue.get(root, full))))
+                AppModel.shared.show(Toast(text: done))
+            } catch {
+                AppModel.shared.show(Toast(text: "\(camera.displayName): couldn't change it (\(error.localizedDescription))", isError: true))
+            }
+        }
     }
 }
 
@@ -1666,6 +1701,7 @@ enum CameraSettingsSelfTest {
                 log("after: brightness=\(m.number(.color, "VideoColorParam.Brightness") ?? -1) mirror=\(JSONValue.key(m.value(.param, "PictureMirror"))) daynight=\(m.value(.param, "DayNightColor") ?? "-") fps=\(m.number(.encode, "MainFormat.Video.FPS") ?? -1) motion=\(m.number(.motion, "Level") ?? -1) region0=\((m.value(.motion, "Region") as? [Any])?.first ?? "-") rec=\(WeekSchedule.cells(m.value(.record, "TimeSection"), masks: m.value(.record, "Mask"))[3][9]) cover=\(m.value(.widget, "Covers.0.RelativePos") ?? "-") title=\(m.titles?.first ?? "-") error=\(m.error ?? "-")")
                 let other = CameraSettingsModel(channel: 1)
                 other.load { log("camera 2: motion=\(other.number(.motion, "Level") ?? -1) mirror=\(JSONValue.key(other.value(.param, "PictureMirror"))) brightness=\(other.number(.color, "VideoColorParam.Brightness") ?? -1)") }
+                if let cam = AppModel.shared.cameras.first { QuickCameraSettings.setDayNight(CameraModes.dayNight[5], camera: cam) }
                 if let b = m.backup(cameraName: "Test") { log("backup: \(b.count) bytes, groups=\(((try? JSONSerialization.jsonObject(with: b)) as? [String: Any])?["settings"].map { ($0 as? [String: Any])?.count ?? 0 } ?? 0)") }
             }),
         ]

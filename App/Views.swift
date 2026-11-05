@@ -225,6 +225,13 @@ struct TileView: View {
             }
             Button("Rename…", action: onRename)
             Button("Camera Settings…", action: onSettings)
+            Menu("Day/Night Mode") {
+                ForEach(CameraModes.dayNight) { o in Button(o.label) { QuickCameraSettings.setDayNight(o, camera: camera) } }
+            }
+            Menu("Light") {
+                ForEach(CameraModes.light.filter { $0.value != "Timing" }) { o in Button(o.label) { QuickCameraSettings.setLight(o, camera: camera) } }
+                Button("Schedule…", action: onSettings)
+            }
             Divider()
             Button("Copy Snapshot") { model.snapshot(camera) }.disabled(!camera.status.isLive)
             Button("Play Recordings from NVR…") {
