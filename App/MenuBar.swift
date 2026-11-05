@@ -29,17 +29,21 @@ final class PreviewGrabber: ObservableObject {
     static let shared = PreviewGrabber()
     @Published var images: [Int: NSImage] = [:]
     private var temp: [Int: CCTVStream] = [:]
-    private let layers = (0..<AppModel.channelCount).map { _ in AVSampleBufferDisplayLayer() }
+    private var layers: [Int: AVSampleBufferDisplayLayer] = [:]
+    private var nvr: UUID?
 
     func refresh() {
         let app = AppModel.shared
-        for (i, cam) in app.cameras.enumerated() {
+        if nvr != app.activeID { images = [:]; nvr = app.activeID }
+        for (i, cam) in app.cameras.prefix(4).enumerated() {
             if let live = cam.sub, let img = live.copySnapshot() {
                 images[i] = NSImage(cgImage: img, size: .zero)
                 continue
             }
             guard temp[i] == nil, let url = app.previewURL(channel: cam.channel) else { continue }
-            let s = CCTVStream(url: url, layer: layers[i])
+            let layer = layers[i] ?? AVSampleBufferDisplayLayer()
+            layers[i] = layer
+            let s = CCTVStream(url: url, layer: layer)
             temp[i] = s
             s.start()
             poll(i, s, tries: 30)
@@ -79,7 +83,7 @@ struct MenuBarContent: View {
                     .help(alerts.lastError ?? "")
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 4), GridItem(.flexible(), spacing: 4)], spacing: 4) {
-                ForEach(app.cameras.indices, id: \.self) { i in
+                ForEach(Array(app.cameras.indices.prefix(4)), id: \.self) { i in
                     Button { open(camera: i) } label: {
                         ZStack(alignment: .bottomLeading) {
                             Rectangle().fill(Color.black).aspectRatio(16 / 9, contentMode: .fit)
@@ -111,7 +115,7 @@ struct MenuBarContent: View {
                     } label: {
                         HStack {
                             Text(e.title)
-                            Text(e.channel < app.cameras.count ? app.cameras[e.channel].displayName : "")
+                            Text(alerts.cameraName(e))
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Text(f.string(from: e.time)).monospacedDigit().foregroundStyle(.secondary)

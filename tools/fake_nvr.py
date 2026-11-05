@@ -128,6 +128,8 @@ def xmeye_file(frames, audio, begin, codec="h264"):
 
 # ---------- server ----------
 
+CAMERA_CFG = {}
+
 FAKE_INFO = {
     "StorageInfo": [{"PartNumber": 1, "PlysicalNo": 0, "Partition": [
         {"DirverType": 0, "IsCurrent": True, "LogicSerialNo": 0, "NewEndTime": "2026-11-04 00:00:00",
@@ -139,6 +141,64 @@ FAKE_INFO = {
     "Record": [{"PacketLength": 60, "PreRecord": 5, "RecordMode": "ConfigRecord", "Redundancy": False}],
     "Status.NatInfo": {"NatStatus": "Conneted", "InfoState": "", "SerialNo": "fake0000000000"},
 }
+
+def _week(first, rest):
+    return [[first] + [rest] * 5 for _ in range(7)]
+
+
+def _handler():
+    return {"AlarmOutEnable": False, "BeepEnable": False, "EventLatch": 1, "MailEnable": False, "MessageEnable": True,
+            "RecordEnable": True, "RecordLatch": 30, "SnapEnable": False, "TipEnable": False, "VoiceEnable": False,
+            "TimeSection": _week("1 00:00:00-24:00:00", "0 00:00:00-00:00:00")}
+
+
+def _stream(res, fps, kbps):
+    return {"AudioEnable": False, "Video": {"BitRate": kbps, "BitRateControl": "VBR", "Compression": "H.265", "FPS": fps,
+                                            "GOP": 2, "Quality": 4, "Resolution": res}, "VideoEnable": True}
+
+
+def default_cfg(name):
+    """Camera settings like an XMEye NVR reports them (python-dvr examples). None = not supported."""
+    if name.startswith("Camera.WhiteLight"):
+        return {"MoveTrigLight": {"Duration": 60, "Level": 3}, "WorkMode": "Auto",
+                "WorkPeriod": {"EHour": 6, "EMinute": 0, "Enable": 1, "SHour": 18, "SMinute": 0}}
+    if name.startswith("Camera.ParamEx"):
+        return [{"AeMeansure": 0, "BroadTrends": {"AutoGain": 0, "Gain": 50}, "CorridorMode": 0, "Dis": 0,
+                 "ExposureTime": "0x00000100", "Ldc": 0, "LightRestrainLevel": 16, "LowLuxMode": 0, "PreventOverExpo": 0,
+                 "SoftPhotosensitivecontrol": 0, "Style": "type1"}]
+    if name.startswith("Camera.Param"):
+        return [{"AeSensitivity": 5, "ApertureMode": "0x00000000", "BLCMode": "0x00000000", "DayNightColor": "0x00000000",
+                 "Day_nfLevel": 3, "DncThr": 30, "ElecLevel": 50, "EsShutter": "0x00000002",
+                 "ExposureParam": {"LeastTime": "0x00000100", "Level": 0, "MostTime": "0x00010000"},
+                 "GainParam": {"AutoGain": 1, "Gain": 50}, "IRCUTMode": 0, "IrcutSwap": 0, "Night_nfLevel": 3,
+                 "PictureFlip": "0x00000000", "PictureMirror": "0x00000000", "RejectFlicker": "0x00000000",
+                 "WhiteBalance": "0x00000000"}]
+    if name.startswith("AVEnc.VideoColor"):
+        p = {"Acutance": 3848, "Brightness": 50, "Contrast": 50, "Gain": 0, "Hue": 50, "Saturation": 50, "Whitebalance": 128}
+        return [{"Enable": True, "TimeSection": "0 00:00:00-24:00:00", "VideoColorParam": dict(p)},
+                {"Enable": False, "TimeSection": "0 00:00:00-24:00:00", "VideoColorParam": dict(p)}]
+    if name == "Simplify.Encode":
+        return [{"ExtraFormat": _stream("D1", 15, 512), "MainFormat": _stream("4M", 20, 2048)} for _ in range(4)]
+    if name.startswith("AVEnc.VideoWidget"):
+        title = {"BackColor": "0x80000000", "EncodeBlend": True, "FrontColor": "0xF0FFFFFF", "PreviewBlend": True}
+        return {"ChannelTitle": {"Name": "CAM", "SerialNo": ""},
+                "ChannelTitleAttribute": dict(title, RelativePos=[6144, 6144, 0, 0]),
+                "Covers": [{"BackColor": "0x00000000", "EncodeBlend": False, "FrontColor": "0x00000000",
+                            "PreviewBlend": False, "RelativePos": [0, 0, 0, 0]} for _ in range(4)],
+                "CoversNum": 4, "TimeTitleAttribute": dict(title, RelativePos=[0, 0, 0, 0])}
+    if name.startswith("Detect.MotionDetect.["):
+        return {"Enable": True, "EventHandler": _handler(), "Level": 3, "Region": ["0x003FFFFF"] * 18}
+    if name.startswith("Detect.HumanDetection.["):
+        return {"Enable": False, "ObjectType": 0, "Sensitivity": 2, "ShowRule": 0, "ShowTrack": 1}
+    if name.startswith("Detect.BlindDetect.["):
+        return {"Enable": False, "EventHandler": _handler(), "Level": 3}
+    if name.startswith("Detect.LossDetect.["):
+        return {"Enable": True, "EventHandler": _handler()}
+    if name.startswith("Record.["):
+        return {"Mask": _week("0x00000007", "0x00000000"), "PacketLength": 60, "PreRecord": 5, "RecordMode": "ConfigRecord",
+                "Redundancy": False, "TimeSection": _week("1 00:00:00-24:00:00", "0 00:00:00-00:00:00")}
+    return None
+
 
 class Recordings:
     def __init__(self, frames, audio, day):
@@ -239,6 +299,23 @@ class Conn(threading.Thread):
             self.reply(msg + 1, {"Name": "SystemInfo", "Ret": 100, "SessionID": self.sid(), "SystemInfo": {
                 "HardWare": "FAKE-NVR", "SoftWareVersion": "V4.03.R11.fake", "VideoInChannel": 4,
                 "SerialNo": "fake0000000000"}})
+        elif msg == 1042 and (name in CAMERA_CFG or default_cfg(name) is not None):
+            if name not in CAMERA_CFG:
+                CAMERA_CFG[name] = default_cfg(name)
+            self.reply(1043, {"Name": name, "Ret": 100, "SessionID": self.sid(), name: CAMERA_CFG[name]})
+        elif msg == 1040:
+            log("set " + name + " = " + json.dumps(req.get(name)))
+            CAMERA_CFG[name] = req.get(name)
+            self.reply(1041, {"Name": name, "Ret": 100, "SessionID": self.sid()})
+        elif msg == 1048 and name == "ChannelTitle":
+            self.reply(1049, {"Name": name, "Ret": 100, "SessionID": self.sid(), name: CAMERA_CFG.setdefault("ChannelTitle", ["CAM01", "CAM02", "CAM03", "CAM04"])})
+        elif msg == 1046 and name == "ChannelTitle":
+            log("set ChannelTitle = " + json.dumps(req.get(name)))
+            CAMERA_CFG["ChannelTitle"] = req.get(name)
+            self.reply(1047, {"Name": name, "Ret": 100, "SessionID": self.sid()})
+        elif msg == 1450:
+            log("op " + name + " = " + json.dumps(req.get(name)))
+            self.reply(1451, {"Name": name, "Ret": 100, "SessionID": self.sid()})
         elif msg in (1020, 1042) and name in FAKE_INFO:
             self.reply(msg + 1, {"Name": name, "Ret": 100, "SessionID": self.sid(), name: FAKE_INFO[name]})
         elif msg == 1452:

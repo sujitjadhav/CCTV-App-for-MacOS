@@ -26,7 +26,7 @@ struct CCTVApp: App {
             CommandMenu("Cameras") {
                 Button("All Cameras") { model.section = .live; model.focus(nil) }
                     .keyboardShortcut("0")
-                ForEach(0..<AppModel.channelCount, id: \.self) { i in
+                ForEach(0..<min(9, model.cameras.count), id: \.self) { i in
                     Button(model.cameras[i].displayName) { model.section = .live; model.focus(i) }
                         .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")))
                 }

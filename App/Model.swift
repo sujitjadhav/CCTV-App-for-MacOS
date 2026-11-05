@@ -10,12 +10,33 @@ enum TileStatus: Equatable {
     var isLive: Bool { self == .live }
 }
 
+/// One NVR (site). Saved in UserDefaults; its password lives in the Keychain.
+struct NVRConfig: Codable, Identifiable, Equatable {
+    static let maxCameras = 100
+
+    var id = UUID()
+    var name = ""
+    var host = ""
+    var rtspPort = 554
+    var dvripPort = 34567
+    var username = "admin"
+    var cameraCount = 4
+    var cameraNames: [String] = []
+    var volumes: [Double] = []
+
+    var displayName: String { !name.isEmpty ? name : (!host.isEmpty ? host : "NVR") }
+    func cameraName(_ index: Int) -> String {
+        index < cameraNames.count && !cameraNames[index].isEmpty ? cameraNames[index] : "Camera \(index + 1)"
+    }
+}
+
 final class Camera: ObservableObject, Identifiable {
-    let channel: Int
+    let nvr: UUID
+    let channel: Int                            // 1-based, as in the RTSP URL
     var id: Int { channel }
     @Published var name: String
     @Published var status: TileStatus = .idle("")
-    @Published var hdStatus: TileStatus = .idle("")   // main stream, only while full size
+    @Published var hdStatus: TileStatus = .idle("")   // main stream, only while large / full size
     @Published var audioOn = false
     @Published var hasAudio = true              // false once we know neither stream carries sound
     @Published var volume: Float = 1 {
@@ -30,7 +51,8 @@ final class Camera: ObservableObject, Identifiable {
     var soundOnly: CCTVStream?                  // HD stream used just for sound (grid view)
     let soundLayer = AVSampleBufferDisplayLayer()
 
-    init(channel: Int, name: String) {
+    init(nvr: UUID, channel: Int, name: String) {
+        self.nvr = nvr
         self.channel = channel
         self.name = name
     }
@@ -38,8 +60,35 @@ final class Camera: ObservableObject, Identifiable {
     var displayName: String { name.isEmpty ? "Camera \(channel)" : name }
 }
 
-enum LiveLayout: String, CaseIterable {
-    case single, grid, onePlusThree
+enum LiveLayout: String, CaseIterable, Identifiable {
+    case single, grid = "grid", grid9, grid16, grid25, onePlusThree, onePlusFive
+    var id: String { rawValue }
+
+    /// Cameras shown at once (one page).
+    var capacity: Int {
+        switch self {
+        case .single: return 1
+        case .grid, .onePlusThree: return 4
+        case .onePlusFive: return 6
+        case .grid9: return 9
+        case .grid16: return 16
+        case .grid25: return 25
+        }
+    }
+    var label: String {
+        switch self {
+        case .single: return "1"
+        case .grid: return "2×2"
+        case .grid9: return "3×3"
+        case .grid16: return "4×4"
+        case .grid25: return "5×5"
+        case .onePlusThree: return "1+3"
+        case .onePlusFive: return "1+5"
+        }
+    }
+    /// Layouts with one big camera (shown in HD).
+    var hasLarge: Bool { self == .single || self == .onePlusThree || self == .onePlusFive }
+    var columns: Int { Int(Double(capacity).squareRoot()) }
 }
 
 enum AppSection: Hashable {
@@ -55,20 +104,34 @@ struct Toast: Equatable {
 
 final class AppModel: ObservableObject {
     static let shared = AppModel()
-    static let channelCount = 4
 
-    @Published var host: String
-    @Published var port: Int
-    @Published var username: String
-    @Published var cameras: [Camera]
+    // MARK: NVRs
+
+    @Published private(set) var nvrs: [NVRConfig]
+    @Published private(set) var activeID: UUID
+    var active: NVRConfig { nvrs.first { $0.id == activeID } ?? nvrs[0] }
+    var host: String { active.host }
+    var port: Int { active.rtspPort }
+    var dvripPort: Int { active.dvripPort }
+    var username: String { active.username }
+
+    @Published private(set) var cameras: [Camera] = []
     @Published var focused: Int?
     @Published var layout: LiveLayout {
-        didSet { defaults.set(layout.rawValue, forKey: "liveLayout"); updateHD() }
+        didSet {
+            defaults.set(layout.rawValue, forKey: "liveLayout")
+            // keep the first camera that was on screen visible
+            let first = oldValue.capacity * page
+            page = first / layout.capacity
+            largeOverride = nil
+            syncStreams()
+        }
     }
-    /// The big camera in the 1x1 and 1+3 layouts.
-    @Published var primary: Int {
-        didSet { defaults.set(primary, forKey: "primaryCamera"); updateHD() }
-    }
+    /// Page of cameras shown when there are more cameras than the layout holds.
+    @Published private(set) var page = 0
+    /// In 1+3 / 1+5: the camera clicked to be large (otherwise the page's first camera).
+    @Published private(set) var largeOverride: Int?
+
     @Published var section: AppSection = .live {
         didSet { updateLiveActive() }
     }
@@ -76,7 +139,6 @@ final class AppModel: ObservableObject {
     private var windowVisible = true
     private var asleep = false
     private var hideWork: DispatchWorkItem?
-    @Published var dvripPort: Int
     /// The NVR's clock zone (recording times are NVR-local). India = Asia/Kolkata, UTC+05:30.
     @Published var nvrTimeZone: TimeZone {
         didSet { defaults.set(nvrTimeZone.identifier, forKey: "nvrTimeZone") }
@@ -89,56 +151,110 @@ final class AppModel: ObservableObject {
     @Published var localNetworkDenied = false
     @Published var toast: Toast?
 
-    private var password: String
+    private var passwords: [UUID: String] = [:]
     private let probe = LocalNetworkProbe()
     private var lastProbe = Date.distantPast
     private var statsTimer: Timer?
-    private let defaults = UserDefaults.standard
+    /// Test runs use their own preferences so they never change the real app's settings.
+    let defaults: UserDefaults
+    let testing: Bool
 
     // Debug only: CCTV_TEST_URL="udp://127.0.0.1:50{s}{ch}" points the app at local test feeds.
     private let testTemplate = ProcessInfo.processInfo.environment["CCTV_TEST_URL"]
 
     private init() {
-        host = defaults.string(forKey: "nvrHost") ?? ""
-        let p = defaults.integer(forKey: "nvrPort")
-        port = p > 0 ? p : 554
-        let dp = defaults.integer(forKey: "dvripPort")
-        dvripPort = dp > 0 ? dp : 34567
-        username = defaults.string(forKey: "nvrUser") ?? "admin"
+        let env = ProcessInfo.processInfo.environment
+        testing = env["CCTV_FAKE_NVR"] != nil || env["CCTV_TEST_URL"] != nil || env["CCTV_FAKE_NVRS"] != nil
+        if testing, let d = UserDefaults(suiteName: "local.home.cctv.selftest") {
+            d.removePersistentDomain(forName: "local.home.cctv.selftest")
+            defaults = d
+        } else {
+            defaults = .standard
+        }
         nvrTimeZone = TimeZone(identifier: defaults.string(forKey: "nvrTimeZone") ?? "") ?? TimeZone(identifier: "Asia/Kolkata")!
         menuBarEnabled = defaults.object(forKey: "menuBarEnabled") as? Bool ?? true
-        password = ""
-        let names = defaults.stringArray(forKey: "cameraNames") ?? []
-        cameras = (1...Self.channelCount).map { ch in
-            Camera(channel: ch, name: ch <= names.count ? names[ch - 1] : "")
-        }
         layout = LiveLayout(rawValue: defaults.string(forKey: "liveLayout") ?? "") ?? .grid
-        primary = min(max(defaults.integer(forKey: "primaryCamera"), 0), Self.channelCount - 1)
-        // Test runs (fake NVR / local feeds) never touch the real Keychain password.
-        let env = ProcessInfo.processInfo.environment
-        let testing = env["CCTV_FAKE_NVR"] != nil || env["CCTV_TEST_URL"] != nil
-        // The Keychain is read in start(), off the main thread: macOS may show an "allow" prompt
-        // (after an update) and the window must be able to open meanwhile.
-        password = ""
+
+        var list = (defaults.data(forKey: "nvrs")).flatMap { try? JSONDecoder().decode([NVRConfig].self, from: $0) } ?? []
+        if list.isEmpty {
+            // First run of this version: turn the old single-NVR settings into the first NVR.
+            var c = NVRConfig()
+            c.name = "Home"
+            c.host = defaults.string(forKey: "nvrHost") ?? ""
+            let p = defaults.integer(forKey: "nvrPort"); if p > 0 { c.rtspPort = p }
+            let dp = defaults.integer(forKey: "dvripPort"); if dp > 0 { c.dvripPort = dp }
+            c.username = defaults.string(forKey: "nvrUser") ?? "admin"
+            c.cameraNames = defaults.stringArray(forKey: "cameraNames") ?? []
+            c.volumes = defaults.array(forKey: "cameraVolumes") as? [Double] ?? []
+            list = [c]
+        }
+        // Debug only: CCTV_FAKE_NVRS="Home=127.0.0.1:34568:pw:4,Shop=127.0.0.1:34569:pw:9"
+        var fakePasswords: [UUID: String] = [:]
+        if let f = env["CCTV_FAKE_NVRS"] {
+            list = f.split(separator: ",").map { item -> NVRConfig in
+                let kv = item.split(separator: "=", maxSplits: 1)
+                let parts = (kv.count > 1 ? kv[1] : "").split(separator: ":")
+                var c = NVRConfig()
+                c.name = String(kv[0])
+                c.host = parts.count > 0 ? String(parts[0]) : "127.0.0.1"
+                c.dvripPort = parts.count > 1 ? Int(parts[1]) ?? 34568 : 34568
+                c.cameraCount = parts.count > 3 ? Int(parts[3]) ?? 4 : 4
+                if parts.count > 2 { fakePasswords[c.id] = String(parts[2]) }
+                return c
+            }
+        }
+        nvrs = list
+        let saved = defaults.string(forKey: "activeNVR").flatMap(UUID.init)
+        activeID = list.first { $0.id == saved }?.id ?? list[0].id
+        passwords = fakePasswords
         passwordLoaded = testing
-        let vols = defaults.array(forKey: "cameraVolumes") as? [Double] ?? []
-        for (i, v) in vols.enumerated() where i < cameras.count { cameras[i].volume = Float(v) }
+        saveNVRs()
+        rebuildCameras()
     }
 
-    private var keychainAccount: String { "\(username)@\(host)" }
-    var hasPassword: Bool { !password.isEmpty }
-    var currentPassword: String { password }
-    /// NVR login for DVRIP (recordings, alerts). nil until a password is saved.
-    var dvripSettings: NVRSettings? {
-        // Debug only: CCTV_FAKE_NVR="127.0.0.1:34568:password" points recordings/alerts at tools/fake_nvr.py.
-        if let f = ProcessInfo.processInfo.environment["CCTV_FAKE_NVR"]?.split(separator: ":", maxSplits: 2), f.count == 3 {
+    private func saveNVRs() {
+        if let d = try? JSONEncoder().encode(nvrs) { defaults.set(d, forKey: "nvrs") }
+        defaults.set(activeID.uuidString, forKey: "activeNVR")
+    }
+
+    private func rebuildCameras() {
+        let c = active
+        cameras = (0..<max(1, min(c.cameraCount, NVRConfig.maxCameras))).map { i in
+            let cam = Camera(nvr: c.id, channel: i + 1, name: i < c.cameraNames.count ? c.cameraNames[i] : "")
+            if i < c.volumes.count { cam.volume = Float(c.volumes[i]) }
+            return cam
+        }
+    }
+
+    private func updateActive(_ change: (inout NVRConfig) -> Void) {
+        guard let i = nvrs.firstIndex(where: { $0.id == activeID }) else { return }
+        change(&nvrs[i])
+        saveNVRs()
+    }
+
+    func nvr(_ id: UUID?) -> NVRConfig? { id.flatMap { id in nvrs.first { $0.id == id } } }
+
+    /// Name of a camera on any NVR (0-based channel), for alerts.
+    func cameraName(nvr id: UUID?, channel: Int) -> String {
+        if id == activeID || id == nil, channel >= 0, channel < cameras.count { return cameras[channel].displayName }
+        return (nvr(id) ?? active).cameraName(channel)
+    }
+
+    var currentPassword: String { passwords[activeID] ?? "" }
+    var hasPassword: Bool { !currentPassword.isEmpty }
+
+    /// DVRIP login for an NVR (recordings, alerts, device info). nil until a password is saved.
+    func settings(for id: UUID) -> NVRSettings? {
+        // Debug only: CCTV_FAKE_NVR="127.0.0.1:34568:password" points the active NVR at tools/fake_nvr.py.
+        if id == activeID, let f = ProcessInfo.processInfo.environment["CCTV_FAKE_NVR"]?.split(separator: ":", maxSplits: 2), f.count == 3 {
             return NVRSettings(host: String(f[0]), rtspPort: port, dvripPort: Int(f[1]) ?? 34568, username: "admin", password: String(f[2]))
         }
-        guard !password.isEmpty, !host.isEmpty else { return nil }
-        return NVRSettings(host: host, rtspPort: port, dvripPort: dvripPort, username: username, password: password)
+        guard let c = nvr(id), let pw = passwords[id], !pw.isEmpty, !c.host.isEmpty else { return nil }
+        return NVRSettings(host: c.host, rtspPort: c.rtspPort, dvripPort: c.dvripPort, username: c.username, password: pw)
     }
+    var dvripSettings: NVRSettings? { settings(for: activeID) }
 
-    var isConfigured: Bool { testTemplate != nil || (!host.isEmpty && !username.isEmpty && !password.isEmpty) }
+    var isConfigured: Bool { testTemplate != nil || (!host.isEmpty && !username.isEmpty && hasPassword) }
 
     // MARK: Stream URLs (contain the login — never log or show these)
 
@@ -154,7 +270,7 @@ final class AppModel: ObservableObject {
                 .replacingOccurrences(of: "{s}", with: main ? "0" : "1")
         }
         guard isConfigured else { return nil }
-        let u = Self.enc(username), p = Self.enc(password)
+        let u = Self.enc(username), p = Self.enc(currentPassword)
         return "rtsp://\(u):\(p)@\(host):\(port)/user=\(u)&password=\(p)&channel=\(channel)&stream=\(main ? 0 : 1).sdp"
     }
 
@@ -163,7 +279,7 @@ final class AppModel: ObservableObject {
 
     // MARK: Lifecycle
 
-    /// True once the saved password has been read from the Keychain.
+    /// True once the saved passwords have been read from the Keychain.
     @Published private(set) var passwordLoaded = false
 
     func start() {
@@ -174,11 +290,22 @@ final class AppModel: ObservableObject {
             finishStartup()
         } else {
             for cam in cameras { cam.status = .idle("Waiting for Keychain access…\nIf macOS asks, click Always Allow") }
-            let account = keychainAccount
+            let list = nvrs
+            // Off the main thread: macOS may show an "allow" prompt after an update.
             DispatchQueue.global(qos: .userInitiated).async {
-                let pw = Keychain.password(for: account) ?? ""
+                var map = Keychain.passwordMap()
+                if map == nil {
+                    // Older versions stored one item per NVR login: move them into the shared item.
+                    var m: [String: String] = [:]
+                    for c in list where !c.host.isEmpty {
+                        if let pw = Keychain.password(for: "\(c.username)@\(c.host)") { m[c.id.uuidString] = pw }
+                    }
+                    if !m.isEmpty { Keychain.setPasswordMap(m) }
+                    map = m
+                }
+                let result = map ?? [:]
                 DispatchQueue.main.async {
-                    self.password = pw
+                    for (k, v) in result { if let id = UUID(uuidString: k) { self.passwords[id] = v } }
                     self.passwordLoaded = true
                     self.finishStartup()
                     AlertCenter.shared.restart()
@@ -189,7 +316,7 @@ final class AppModel: ObservableObject {
         if ProcessInfo.processInfo.environment["CCTV_STATS"] != nil {
             statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
                 guard let self else { return }
-                for c in self.cameras {
+                for c in self.cameras where c.sub != nil || c.main != nil {
                     let sub = c.sub?.takeFrameCount() ?? 0, main = c.main?.takeFrameCount() ?? 0
                     func res(_ s: CCTVStream?) -> String { guard let z = s?.videoSize, z.width > 0 else { return "-" }; return "\(Int(z.width))x\(Int(z.height))" }
                     FileHandle.standardError.write("cam\(c.channel): sub \(res(c.sub)) \(sub) frames, main \(res(c.main)) \(main) frames, \(c.status), hd \(c.hdStatus), active \(self.liveActive)\n".data(using: .utf8)!)
@@ -198,96 +325,67 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Debug: CCTV_SELFTEST=1 runs full-size view and snapshot on its own;
-    /// CCTV_SELFTEST=view only opens camera 1 full size, returns to the grid, then hides and shows the app.
+    private func savePasswords() {
+        let map = Dictionary(uniqueKeysWithValues: passwords.map { ($0.key.uuidString, $0.value) })
+        guard !testing else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = Keychain.setPasswordMap(map)
+            if !ok { DispatchQueue.main.async { self.show(Toast(text: "Couldn't save the password to the Keychain", isError: true)) } }
+        }
+    }
+
+    // MARK: Self-tests (debug only)
+
     private func runSelfTest() {
         func log(_ s: String) { FileHandle.standardError.write("selftest: \(s)\n".data(using: .utf8)!) }
-        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "recordings" { PhaseSelfTest.run(); return }
-        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "events" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.section = .events }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                func walk(_ v: NSView, _ depth: Int = 0) {
-                    if let t = v as? NSTableView {
-                        log("table: rows=\(t.numberOfRows) cols=\(t.numberOfColumns) frame=\(t.frame) visible=\(t.visibleRect)")
-                    }
-                    if let sv = v as? NSScrollView { log("scrollview frame=\(sv.frame) hidden=\(sv.isHidden)") }
-                    for c in v.subviews { walk(c, depth + 1) }
-                }
-                log("events in model: \(AlertCenter.shared.events.count)")
-                if let out = ProcessInfo.processInfo.environment["CCTV_SNAPSHOT"],
-                   let w = NSApp.windows.first(where: { $0.isVisible && $0.frame.width > 200 }), let v = w.contentView,
-                   let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
-                    v.cacheDisplay(in: v.bounds, to: rep)
-                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
-                    log("window image written")
-                }
-                for w in NSApp.windows where w.isVisible { log("window \(w.frame)"); if let cv = w.contentView { walk(cv) } }
-            }
-            return
-        }
-        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "device" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.section = .device }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 7) {
+        let mode = ProcessInfo.processInfo.environment["CCTV_SELFTEST"] ?? ""
+        func run(_ steps: [(Double, () -> Void)]) { for (t, f) in steps { DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: f) } }
+        func running() -> String { cameras.filter { $0.sub != nil }.map { "\($0.channel)" }.joined(separator: ",") }
+        func hd() -> String { cameras.filter { $0.main != nil }.map { "\($0.channel)" }.joined(separator: ",") }
+        switch mode {
+        case "recordings": PhaseSelfTest.run()
+        case "camerasettings": CameraSettingsSelfTest.run()
+        case "events":
+            run([(2, { self.section = .events }), (5, { log("events in model: \(AlertCenter.shared.events.count)") })])
+        case "device":
+            run([(2, { self.section = .device }), (7, {
                 let d = DeviceModel.shared
                 log("device: online=\(d.online) error=\(d.error ?? "-") title=\(d.title)")
-                for (n, rows) in [("system", d.system), ("device", d.device), ("network", d.network), ("recording", d.recording + d.general)] {
-                    log("\(n): " + rows.map { "\($0.label)=\($0.value)" }.joined(separator: " | "))
-                }
-                for k in d.disks { log("disk \(k.id): total=\(DeviceModel.size(mb: k.totalMB)) used=\(DeviceModel.size(mb: k.usedMB)) \(Int(k.fraction * 100))% \(k.status)") }
-            }
-            return
-        }
-        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "audio" {
-            let c = self.cameras[0]
-            func st() -> String { "sub=\(String(describing: c.subHasAudio)) main=\(String(describing: c.mainHasAudio)) hasAudio=\(c.hasAudio) soundOnly=\(c.soundOnly != nil) hdVideo=\(c.main != nil) level=\(String(format: "%.3f", self.audioLevel(c)))" }
-            let steps: [(Double, () -> Void)] = [
+                for k in d.disks { log("disk \(k.id): total=\(DeviceModel.size(mb: k.totalMB)) \(Int(k.fraction * 100))%") }
+            })])
+        case "audio":
+            let c = cameras[0]
+            func st() -> String { "sub=\(String(describing: c.subHasAudio)) main=\(String(describing: c.mainHasAudio)) soundOnly=\(c.soundOnly != nil) hdVideo=\(c.main != nil) level=\(String(format: "%.3f", self.audioLevel(c)))" }
+            run([
                 (4, { self.layout = .grid; self.focus(nil); self.setAudio(true, for: c) }),
                 (8, { log("grid, sound on: \(st())"); self.focus(0) }),
-                (14, { log("full size HD: \(st())"); self.setVolume(0.3, for: c) }),
-                (16, { log("volume 0.3: \(st()) player volume=\(c.main?.volume ?? -1)"); self.focus(nil) }),
-                (19, { log("back to grid: \(st())") }),
-            ]
-            for (t, f) in steps { DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: f) }
-            return
+                (14, { log("full size HD: \(st())"); self.focus(nil) }),
+                (17, { log("back to grid: \(st())") }),
+            ])
+        case "pages":
+            // 12 cameras: check which streams run per layout/page, and switching NVR.
+            run([
+                (4, { self.layout = .grid; log("2x2 page \(self.page + 1)/\(self.pageCount): running=[\(running())] hd=[\(hd())]") ; self.setPage(1) }),
+                (7, { log("2x2 page \(self.page + 1)/\(self.pageCount): running=[\(running())]"); self.layout = .grid9 }),
+                (10, { log("3x3 page \(self.page + 1)/\(self.pageCount): running=[\(running())]"); self.layout = .onePlusFive }),
+                (13, { log("1+5 page \(self.page + 1)/\(self.pageCount): running=[\(running())] hd=[\(hd())]"); self.makeLarge(self.visibleRange.last ?? 0) }),
+                (16, { log("1+5 clicked last: large=\(self.largeIndex.map { $0 + 1 } ?? 0) hd=[\(hd())]"); self.layout = .single; self.setPage(11) }),
+                (19, { log("single page \(self.page + 1)/\(self.pageCount): running=[\(running())] hd=[\(hd())]"); self.focus(2) }),
+                (22, { log("focus cam3: page=\(self.page + 1) running=[\(running())] hd=[\(hd())]"); self.focus(nil)
+                       if self.nvrs.count > 1 { self.selectNVR(self.nvrs[1].id) } }),
+                (26, { log("switched to \(self.active.displayName): cameras=\(self.cameras.count) running=[\(running())] layoutPage=\(self.page + 1)/\(self.pageCount)")
+                       let a = AlertCenter.shared
+                       let byNVR = Dictionary(grouping: a.events, by: { self.nvr(a.nvrID(of: $0))?.displayName ?? "?" }).mapValues(\.count)
+                       log("alerts: listening to \(a.connectedNVRs.count) NVRs, events by NVR: \(byNVR)") }),
+            ])
+        default:
+            run([(5, { self.focus(1) }), (9, { log("hd=[\(hd())]"); self.focus(nil) })])
         }
-        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "layouts" {
-            func hd() -> String { self.cameras.enumerated().filter { $0.element.main != nil }.map { "cam\($0.offset + 1)" }.joined(separator: ",") }
-            let steps: [(Double, () -> Void)] = [
-                (4, { self.layout = .grid; self.primary = 0; self.focus(nil) }),
-                (6, { log("grid: hd=[\(hd())]"); self.layout = .onePlusThree }),
-                (10, { log("1+3 primary cam1: hd=[\(hd())]"); self.primary = 2 }),
-                (14, { log("1+3 primary cam3: hd=[\(hd())] size=\(self.cameras[2].main?.videoSize ?? .zero)"); self.layout = .single }),
-                (17, { log("single: hd=[\(hd())]"); self.stepPrimary(1) }),
-                (20, { log("single next: primary=cam\(self.primary + 1) hd=[\(hd())]"); self.layout = .grid }),
-                (22, { log("grid again: hd=[\(hd())]"); self.snapshot(self.cameras[1]) }),
-                (23, { log("toast: \(self.toast?.text ?? "-")") }),
-                (35, { log("toast: \(self.toast?.text ?? "-") file=\(self.toast?.file?.lastPathComponent ?? "-")"); self.rename(self.cameras[0], to: "Gate") }),
-                (36, { log("names saved: \(UserDefaults.standard.stringArray(forKey: "cameraNames") ?? [])") }),
-            ]
-            for (t, f) in steps { DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: f) }
-            return
-        }
-        if ProcessInfo.processInfo.environment["CCTV_SELFTEST"] == "view" {
-            let steps: [(Double, () -> Void)] = [
-                (6, { log("open camera 1 full size"); self.focus(0) }),
-                (16, { log("back to grid (hd shown was \(self.cameras[0].video.showsMain))"); self.focus(nil) }),
-                (19, { log("hide app"); NSApp.hide(nil) }),
-                (27, { log("show app"); NSApp.unhide(nil) }),
-            ]
-            for (t, f) in steps { DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: f) }
-            return
-        }
-        let steps: [(Double, () -> Void)] = [
-            (5, { log("focus camera 2"); self.focus(1) }),
-            (9, { log("snapshot camera 2 (hd shown: \(self.cameras[1].video.showsMain))"); self.snapshot(self.cameras[1]) }),
-            (24, { log("back to grid; snapshot camera 3"); self.focus(nil); self.snapshot(self.cameras[2]) }),
-            (26, { log("toast: \(self.toast?.text ?? "none")") }),
-        ]
-        for (t, f) in steps { DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: f) }
     }
 
     // MARK: Pause / resume
-    // Streams run only while the Live screen is showing in a visible window and the Mac is awake.
+    // Streams run only while the Live screen is showing in a visible window and the Mac is awake,
+    // and only for the cameras on the current page.
 
     private(set) var liveActive = false
 
@@ -304,7 +402,7 @@ final class AppModel: ObservableObject {
         let on = section == .live && windowVisible && !asleep
         guard on != liveActive else { return }
         liveActive = on
-        if on { connectAll(clear: false) } else { pauseLive() }
+        if on { syncStreams() } else { pauseLive() }
     }
 
     private func pauseLive() {
@@ -362,16 +460,67 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Restarts all live streams. `clear` wipes the last picture (use when settings change).
-    func connectAll(clear: Bool = true) {
-        guard liveActive else { return }
-        for cam in cameras { startSub(cam, clear: clear) }
-        for cam in cameras where cam.main != nil { stopMain(cam) }
+    // MARK: Pages and layouts
+
+    var pageCount: Int { max(1, (cameras.count + layout.capacity - 1) / layout.capacity) }
+
+    /// Cameras on the current page.
+    var visibleRange: Range<Int> {
+        let start = min(page, pageCount - 1) * layout.capacity
+        return start..<min(cameras.count, start + layout.capacity)
+    }
+
+    /// The big camera in 1×1 / 1+3 / 1+5 (shown in HD).
+    var largeIndex: Int? {
+        guard layout.hasLarge else { return nil }
+        if let o = largeOverride, visibleRange.contains(o) { return o }
+        return visibleRange.first
+    }
+
+    /// Camera showing the HD main stream: the full-size one, or the big one.
+    var hdIndex: Int? { focused ?? largeIndex }
+
+    func setPage(_ p: Int) {
+        let n = pageCount
+        page = ((p % n) + n) % n
+        largeOverride = nil
+        syncStreams()
+    }
+
+    func stepPage(_ delta: Int) { setPage(page + delta) }
+
+    func makeLarge(_ index: Int) {
+        guard layout.hasLarge, visibleRange.contains(index) else { return }
+        largeOverride = index
         updateHD()
     }
 
-    /// Camera that should show the HD main stream: the full-size one, or the big one in 1x1 / 1+3.
-    var hdIndex: Int? { focused ?? (layout == .grid ? nil : primary) }
+    /// Starts streams for the cameras on screen and stops the rest (keeps CPU low with many cameras).
+    private func syncStreams(clear: Bool = false) {
+        guard started else { return }
+        let vis = visibleRange
+        for (i, cam) in cameras.enumerated() {
+            let run = liveActive && (vis.contains(i) || focused == i)
+            if run && cam.sub == nil {
+                startSub(cam, clear: clear)
+            } else if !run && cam.sub != nil {
+                cam.sub?.stop(); cam.sub = nil
+                cam.status = .idle("")
+                routeAudio(cam)
+            }
+        }
+        updateHD()
+    }
+
+    /// Restarts all live streams. `clear` wipes the last picture (use when settings change).
+    func connectAll(clear: Bool = true) {
+        guard liveActive else { return }
+        for cam in cameras {
+            cam.sub?.stop(); cam.sub = nil
+            if cam.main != nil { stopMain(cam) }
+        }
+        syncStreams(clear: clear)
+    }
 
     private func updateHD() {
         guard started else { return }
@@ -390,23 +539,73 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: NVR management
+
+    func selectNVR(_ id: UUID) {
+        guard id != activeID, nvrs.contains(where: { $0.id == id }) else { return }
+        stopAllForQuit()
+        liveActive = false
+        activeID = id
+        saveNVRs()
+        focused = nil
+        page = 0
+        largeOverride = nil
+        rebuildCameras()
+        RecordingsModel.shared.reset()
+        DeviceModel.shared.reset()
+        settingsMessage = nil
+        if !isConfigured { section = .settings }
+        updateLiveActive()
+    }
+
+    func addNVR() {
+        var c = NVRConfig()
+        c.name = "NVR \(nvrs.count + 1)"
+        nvrs.append(c)
+        saveNVRs()
+        selectNVR(c.id)
+        section = .settings
+    }
+
+    func removeActiveNVR() {
+        guard nvrs.count > 1 else { return }
+        let id = activeID
+        let next = nvrs.first { $0.id != id }!.id
+        selectNVR(next)
+        nvrs.removeAll { $0.id == id }
+        passwords[id] = nil
+        saveNVRs()
+        savePasswords()
+        AlertCenter.shared.restart()
+    }
+
     // MARK: Settings
 
-    func saveSettings(host: String, port: Int, dvripPort: Int, username: String, password: String, names: [String]) {
-        self.host = host
-        self.port = port
-        self.dvripPort = dvripPort
-        defaults.set(dvripPort, forKey: "dvripPort")
-        self.username = username
-        self.password = password
-        defaults.set(host, forKey: "nvrHost")
-        defaults.set(port, forKey: "nvrPort")
-        defaults.set(username, forKey: "nvrUser")
-        if !Keychain.setPassword(password, for: keychainAccount) {
-            show(Toast(text: "Couldn't save the password to the Keychain", isError: true))
+    func saveSettings(name: String, host: String, port: Int, dvripPort: Int, username: String, password: String,
+                      cameraCount: Int, names: [String]) {
+        let count = max(1, min(cameraCount, NVRConfig.maxCameras))
+        let countChanged = count != cameras.count
+        updateActive {
+            $0.name = name
+            $0.host = host
+            $0.rtspPort = port
+            $0.dvripPort = dvripPort
+            $0.username = username
+            $0.cameraCount = count
+            $0.cameraNames = Array(names.prefix(count))
         }
-        for (i, n) in names.enumerated() where i < cameras.count { cameras[i].name = n }
-        saveNames()
+        passwords[activeID] = password
+        savePasswords()
+        if countChanged {
+            stopAllForQuit()
+            focused = nil
+            page = 0
+            largeOverride = nil
+            rebuildCameras()
+        } else {
+            for (i, n) in names.enumerated() where i < cameras.count { cameras[i].name = n }
+        }
+        objectWillChange.send()
         settingsMessage = nil
         show(Toast(text: "Settings saved"))
         connectAll()
@@ -418,7 +617,18 @@ final class AppModel: ObservableObject {
         saveNames()
     }
 
-    private func saveNames() { defaults.set(cameras.map(\.name), forKey: "cameraNames") }
+    private func saveNames() { updateActive { $0.cameraNames = cameras.map(\.name) } }
+
+    /// Asks the NVR how many cameras it has (login reply / SystemInfo).
+    func detectCameraCount(_ s: NVRSettings) async -> Int? {
+        let c = DVRIPClient(host: s.host, port: s.dvripPort, username: s.username, password: s.password, timeZone: nvrTimeZone)
+        defer { c.close() }
+        guard (try? await c.login()) != nil else { return nil }
+        if let n = c.channelCount, n > 0 { return min(n, NVRConfig.maxCameras) }
+        let info = (try? await c.systemInfo()) ?? [:]
+        let v = (info["VideoInChannel"] as? Int ?? 0) + (info["DigChannel"] as? Int ?? 0)
+        return v > 0 ? min(v, NVRConfig.maxCameras) : nil
+    }
 
     // MARK: Streams
 
@@ -519,12 +729,12 @@ final class AppModel: ObservableObject {
     func toggleFocus(_ index: Int) { focus(focused == index ? nil : index) }
 
     func focus(_ index: Int?) {
-        focused = index
-        updateHD()
-    }
-
-    func stepPrimary(_ delta: Int) {
-        primary = (primary + delta + Self.channelCount) % Self.channelCount
+        if let i = index, i < cameras.count, !visibleRange.contains(i) {
+            page = i / layout.capacity
+            largeOverride = nil
+        }
+        focused = index.flatMap { $0 < cameras.count ? $0 : nil }
+        syncStreams()
     }
 
     // MARK: Sound
@@ -543,7 +753,8 @@ final class AppModel: ObservableObject {
         cam.sub?.setAudioEnabled(cam.audioOn && !useMain)
         cam.main?.setAudioEnabled(cam.audioOn && useMain)
 
-        let needSoundOnly = cam.audioOn && liveActive && cam.main == nil && cam.subHasAudio == false && cam.mainHasAudio != false
+        let needSoundOnly = cam.audioOn && liveActive && cam.sub != nil && cam.main == nil
+            && cam.subHasAudio == false && cam.mainHasAudio != false
         if needSoundOnly && cam.soundOnly == nil, let url = streamURL(channel: cam.channel, main: true) {
             let s = CCTVStream(url: url, layer: cam.soundLayer)
             s.videoEnabled = false
@@ -570,10 +781,8 @@ final class AppModel: ObservableObject {
 
     func setVolume(_ v: Float, for cam: Camera) {
         cam.volume = v
-        saveVolumes()
+        updateActive { $0.volumes = cameras.map { Double($0.volume) } }
     }
-
-    func saveVolumes() { defaults.set(cameras.map { Double($0.volume) }, forKey: "cameraVolumes") }
 
     // MARK: Snapshot (copied to the clipboard — nothing is saved on the Mac)
 

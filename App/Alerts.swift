@@ -11,6 +11,7 @@ struct AlertEvent: Codable, Identifiable, Hashable {
     let event: String         // e.g. VideoMotion
     let time: Date
     var notified: Bool
+    var nvr: UUID? = nil      // which NVR (nil = logged before multi-NVR support → the first NVR)
 
     var title: String { AlertEvent.title(for: event) }
     var icon: String { AlertEvent.icon(for: event) }
@@ -56,33 +57,42 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
 
     // Settings
     @Published var enabled: Bool { didSet { save(); restart() } }
-    @Published var cameraEnabled: [Bool] { didSet { save() } }
+    /// Cameras with alerts turned off, as "nvrID:channel" (0-based).
+    @Published private(set) var disabled: Set<String> { didSet { save() } }
     @Published var quietEnabled: Bool { didSet { save() } }
     @Published var quietFrom: Int { didSet { save() } }   // minutes after midnight (Mac local time)
     @Published var quietTo: Int { didSet { save() } }
 
     // State
     @Published var events: [AlertEvent] = []
-    @Published var connected = false
+    @Published private(set) var connectedNVRs: Set<UUID> = []
     @Published var lastError: String?
     @Published var unseen = 0
 
-    private var task: Task<Void, Never>?
-    private var lastNotified: [Int: Date] = [:]
-    private let d = UserDefaults.standard
+    /// Listening to the NVR currently shown.
+    var connected: Bool { connectedNVRs.contains(AppModel.shared.activeID) }
+
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var lastNotified: [String: Date] = [:]
+    private var d: UserDefaults { AppModel.shared.defaults }
     private let logURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("CCTV", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Test runs against the fake NVR keep their own log.
-        let test = ProcessInfo.processInfo.environment["CCTV_FAKE_NVR"] != nil
-        return dir.appendingPathComponent(test ? "events-test.json" : "events.json")
+        // Test runs keep their own log.
+        return dir.appendingPathComponent(AppModel.shared.testing ? "events-test.json" : "events.json")
     }()
 
     override init() {
+        let d = AppModel.shared.defaults
         enabled = d.object(forKey: "alertsEnabled") as? Bool ?? true
-        let cams = d.array(forKey: "alertCameras") as? [Bool] ?? []
-        cameraEnabled = (0..<AppModel.channelCount).map { $0 < cams.count ? cams[$0] : true }
+        var off = Set(d.stringArray(forKey: "alertsDisabled") ?? [])
+        if d.object(forKey: "alertsDisabled") == nil, let old = d.array(forKey: "alertCameras") as? [Bool] {
+            // Older versions: one on/off per camera of the single NVR.
+            let first = AppModel.shared.nvrs[0].id
+            for (i, on) in old.enumerated() where !on { off.insert("\(first.uuidString):\(i)") }
+        }
+        disabled = off
         quietEnabled = d.bool(forKey: "quietEnabled")
         quietFrom = d.object(forKey: "quietFrom") as? Int ?? 23 * 60
         quietTo = d.object(forKey: "quietTo") as? Int ?? 7 * 60
@@ -94,11 +104,20 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
 
     private func save() {
         d.set(enabled, forKey: "alertsEnabled")
-        d.set(cameraEnabled, forKey: "alertCameras")
+        d.set(Array(disabled), forKey: "alertsDisabled")
         d.set(quietEnabled, forKey: "quietEnabled")
         d.set(quietFrom, forKey: "quietFrom")
         d.set(quietTo, forKey: "quietTo")
     }
+
+    private static func key(_ nvr: UUID, _ ch: Int) -> String { "\(nvr.uuidString):\(ch)" }
+    func isOn(nvr: UUID, channel: Int) -> Bool { !disabled.contains(Self.key(nvr, channel)) }
+    func set(_ on: Bool, nvr: UUID, channel: Int) {
+        if on { disabled.remove(Self.key(nvr, channel)) } else { disabled.insert(Self.key(nvr, channel)) }
+    }
+
+    /// NVR an event belongs to (old log entries belong to the first NVR).
+    func nvrID(of e: AlertEvent) -> UUID { e.nvr ?? AppModel.shared.nvrs[0].id }
 
     func start() {
         UNUserNotificationCenter.current().delegate = self
@@ -106,31 +125,37 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
         restart()
     }
 
-    /// (Re)connects the alarm listener, e.g. after settings change.
+    /// (Re)connects one alarm listener per NVR that has a password, e.g. after settings change.
     func restart() {
-        task?.cancel()
-        task = nil
-        connected = false
-        guard enabled, AppModel.shared.dvripSettings != nil else { return }
-        task = Task { [weak self] in await self?.listen() }
+        for t in tasks.values { t.cancel() }
+        tasks = [:]
+        connectedNVRs = []
+        guard enabled else { return }
+        for n in AppModel.shared.nvrs where AppModel.shared.settings(for: n.id) != nil {
+            let id = n.id
+            tasks[id] = Task { [weak self] in await self?.listen(id) }
+        }
     }
 
-    private func listen() async {
+    private func listen(_ id: UUID) async {
         var backoff: UInt64 = 2
         while !Task.isCancelled {
             do {
-                let client = try await DVRIPClient.connected()
+                guard let s = await MainActor.run(body: { AppModel.shared.settings(for: id) }) else { break }
+                let tz = await MainActor.run { AppModel.shared.nvrTimeZone }
+                let client = DVRIPClient(host: s.host, port: s.dvripPort, username: s.username, password: s.password, timeZone: tz)
                 defer { client.close() }
-                await MainActor.run { self.connected = true; self.lastError = nil }
+                try await client.login()
+                await MainActor.run { _ = self.connectedNVRs.insert(id); self.lastError = nil }
                 backoff = 2
                 for try await alarm in client.alarms() {
-                    await MainActor.run { self.handle(alarm) }
+                    await MainActor.run { self.handle(alarm, nvr: id) }
                 }
-                await MainActor.run { self.connected = false }
+                await MainActor.run { _ = self.connectedNVRs.remove(id) }
             } catch is CancellationError {
                 break
             } catch {
-                await MainActor.run { self.connected = false; self.lastError = error.localizedDescription }
+                await MainActor.run { _ = self.connectedNVRs.remove(id); self.lastError = error.localizedDescription }
             }
             try? await Task.sleep(nanoseconds: backoff * 1_000_000_000)
             backoff = min(backoff * 2, 60)
@@ -144,17 +169,19 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
         return quietFrom <= quietTo ? (m >= quietFrom && m < quietTo) : (m >= quietFrom || m < quietTo)
     }
 
-    private func handle(_ a: DVRIPAlarm) {
+    private func handle(_ a: DVRIPAlarm, nvr: UUID) {
         guard a.status.lowercased() != "stop" else { return }
         let ch = a.channel
         let time = a.time ?? Date()
+        let k = Self.key(nvr, ch)
         // NVRs repeat "Start" while motion continues; one notification per camera per minute.
-        if let last = lastNotified[ch], time.timeIntervalSince(last) < 60, events.first?.channel == ch { return }
-        let allowed = ch >= 0 && ch < cameraEnabled.count && cameraEnabled[ch] && !isQuietNow
-        var e = AlertEvent(channel: ch, event: a.event, time: time, notified: false)
+        if let last = lastNotified[k], time.timeIntervalSince(last) < 60,
+           let prev = events.first, prev.channel == ch, nvrID(of: prev) == nvr { return }
+        let allowed = ch >= 0 && isOn(nvr: nvr, channel: ch) && !isQuietNow
+        var e = AlertEvent(channel: ch, event: a.event, time: time, notified: false, nvr: nvr)
         if allowed {
             e.notified = true
-            lastNotified[ch] = time
+            lastNotified[k] = time
             notify(e)
         }
         events.insert(e, at: 0)
@@ -169,18 +196,20 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
 
     func clearLog() { events = []; unseen = 0; persist() }
 
-    private func cameraName(_ ch: Int) -> String {
-        ch >= 0 && ch < AppModel.shared.cameras.count ? AppModel.shared.cameras[ch].displayName : "Camera \(ch + 1)"
+    func cameraName(_ e: AlertEvent) -> String {
+        AppModel.shared.cameraName(nvr: nvrID(of: e), channel: e.channel)
     }
 
     private func notify(_ e: AlertEvent) {
+        let app = AppModel.shared
         let f = DateFormatter()
         f.timeStyle = .medium
         let c = UNMutableNotificationContent()
-        c.title = "\(e.title) — \(cameraName(e.channel))"
+        let site = app.nvrs.count > 1 ? " · \(app.nvr(e.nvr)?.displayName ?? "")" : ""
+        c.title = "\(e.title) — \(cameraName(e))\(site)"
         c.body = "at \(f.string(from: e.time)). Click to watch live."
         c.sound = .default
-        c.userInfo = ["channel": e.channel]
+        c.userInfo = ["channel": e.channel, "nvr": e.nvr?.uuidString ?? ""]
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: e.id.uuidString, content: c, trigger: nil))
     }
 
@@ -190,20 +219,26 @@ final class AlertCenter: NSObject, ObservableObject, UNUserNotificationCenterDel
         done([.banner, .sound, .list])
     }
 
-    // Clicking a notification opens that camera live, full size.
+    // Clicking a notification opens that camera live, full size (switching NVR if needed).
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler done: @escaping () -> Void) {
-        let ch = response.notification.request.content.userInfo["channel"] as? Int ?? 0
+        let info = response.notification.request.content.userInfo
+        let ch = info["channel"] as? Int ?? 0
+        let nvr = (info["nvr"] as? String).flatMap(UUID.init)
         DispatchQueue.main.async {
+            let app = AppModel.shared
             AppDelegate.showMainWindow()
-            AppModel.shared.section = .live
-            AppModel.shared.focus(min(max(ch, 0), AppModel.channelCount - 1))
+            if let nvr { app.selectNVR(nvr) }
+            app.section = .live
+            app.focus(min(max(ch, 0), app.cameras.count - 1))
         }
         done()
     }
 
     /// Debug: pretend the NVR sent an alarm (CCTV_SELFTEST).
-    func simulate(channel: Int) { handle(DVRIPAlarm(channel: channel, event: "VideoMotion", status: "Start", time: Date())) }
+    func simulate(channel: Int) {
+        handle(DVRIPAlarm(channel: channel, event: "VideoMotion", status: "Start", time: Date()), nvr: AppModel.shared.activeID)
+    }
 }
 
 // MARK: - Event log view
@@ -217,7 +252,8 @@ struct EventsView: View {
     @State private var selection: AlertEvent.ID?
 
     private var filtered: [AlertEvent] {
-        alerts.events.filter { (cameraFilter < 0 || $0.channel == cameraFilter) && (typeFilter.isEmpty || $0.title == typeFilter) }
+        alerts.events.filter { alerts.nvrID(of: $0) == app.activeID
+            && (cameraFilter < 0 || $0.channel == cameraFilter) && (typeFilter.isEmpty || $0.title == typeFilter) }
     }
     private var selected: AlertEvent? { selection.flatMap { id in alerts.events.first { $0.id == id } } }
 
@@ -326,9 +362,7 @@ struct EventsView: View {
         }
     }
 
-    private func cameraName(_ ch: Int) -> String {
-        ch >= 0 && ch < app.cameras.count ? app.cameras[ch].displayName : "Camera \(ch + 1)"
-    }
+    private func cameraName(_ ch: Int) -> String { app.cameraName(nvr: app.activeID, channel: ch) }
 
     /// Plays the NVR recording around the alert inside the Events screen.
     private func watch(_ e: AlertEvent) {
@@ -358,8 +392,12 @@ struct MoreSettings: View {
         }
         Section("Alerts") {
             Toggle("Notify me about motion and alarms from the NVR", isOn: $alerts.enabled)
-            ForEach(app.cameras.indices, id: \.self) { i in
-                Toggle(app.cameras[i].displayName, isOn: $alerts.cameraEnabled[i]).disabled(!alerts.enabled)
+            DisclosureGroup("Cameras on \(app.active.displayName) (\(app.cameras.count))") {
+                ForEach(app.cameras.indices, id: \.self) { i in
+                    Toggle(app.cameras[i].displayName, isOn: Binding(get: { alerts.isOn(nvr: app.activeID, channel: i) },
+                                                                     set: { alerts.set($0, nvr: app.activeID, channel: i) }))
+                        .disabled(!alerts.enabled)
+                }
             }
             Toggle("Quiet hours (no notifications, still logged)", isOn: $alerts.quietEnabled).disabled(!alerts.enabled)
             if alerts.quietEnabled {

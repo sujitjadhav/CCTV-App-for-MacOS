@@ -36,6 +36,12 @@ final class DeviceModel: ObservableObject {
     @Published var title = "NVR"
     @Published var online = false
 
+    /// Clear the previous NVR's details (after switching NVR).
+    func reset() {
+        system = []; device = []; network = []; recording = []; general = []; disks = []; raw = []
+        title = "NVR"; online = false; error = nil; updated = nil
+    }
+
     func load() {
         guard !loading else { return }
         loading = true
@@ -62,6 +68,42 @@ final class DeviceModel: ObservableObject {
                 self.error = error.localizedDescription
             }
             self.loading = false
+        }
+    }
+
+    // MARK: Maintenance
+
+    /// Sets the NVR's clock to this Mac's time (python-dvr set_time: OPTimeSetting, msg 1450).
+    func syncClock() {
+        Task { @MainActor in
+            do {
+                let c = try await DVRIPClient.connected()
+                defer { c.close() }
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                f.timeZone = AppModel.shared.nvrTimeZone
+                try await c.set("OPTimeSetting", f.string(from: Date()), msg: 1450)
+                AppModel.shared.show(Toast(text: "NVR clock set to this Mac's time"))
+                self.load()
+            } catch {
+                AppModel.shared.show(Toast(text: "Couldn't set the NVR clock: \(error.localizedDescription)", isError: true))
+            }
+        }
+    }
+
+    /// Restarts the NVR (OPMachine Reboot, msg 1450). Cameras reconnect on their own afterwards.
+    func reboot() {
+        Task { @MainActor in
+            do {
+                let c = try await DVRIPClient.connected()
+                defer { c.close() }
+                try await c.set("OPMachine", ["Action": "Reboot"], msg: 1450)
+                self.online = false
+                AppModel.shared.show(Toast(text: "The NVR is restarting. Cameras come back in about a minute."))
+            } catch {
+                AppModel.shared.show(Toast(text: "Couldn't restart the NVR: \(error.localizedDescription)", isError: true))
+            }
         }
     }
 
@@ -181,6 +223,7 @@ final class DeviceModel: ObservableObject {
 
 struct DeviceView: View {
     @ObservedObject var dev = DeviceModel.shared
+    @State private var confirmReboot = false
 
     var body: some View {
         ScrollView {
@@ -242,6 +285,16 @@ struct DeviceView: View {
             .disabled(!dev.online)
             Button { dev.load() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                 .disabled(dev.loading)
+            Menu {
+                Button("Set NVR Clock to This Mac's Time") { dev.syncClock() }
+                Divider()
+                Button("Restart NVR…", role: .destructive) { confirmReboot = true }
+            } label: { Label("Maintenance", systemImage: "wrench.and.screwdriver") }
+            .fixedSize()
+            .disabled(!dev.online)
+            .confirmationDialog("Restart the NVR?", isPresented: $confirmReboot) {
+                Button("Restart", role: .destructive) { dev.reboot() }
+            } message: { Text("All cameras stop recording for about a minute while it restarts.") }
         }
     }
 }

@@ -102,6 +102,14 @@ final class RecordingsModel: ObservableObject {
         load(thenPlay: at)
     }
 
+    /// Forget everything about the previous NVR (after switching NVR).
+    func reset() {
+        releaseMemory()
+        files = []
+        channel = 0
+        message = nil
+    }
+
     /// Stops playback and frees memory (when leaving the Recordings screen).
     func releaseMemory() {
         expanded = false

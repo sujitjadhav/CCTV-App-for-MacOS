@@ -16,10 +16,11 @@ struct RootView: View {
                 Label("Recordings", systemImage: "film.stack").tag(AppSection.recordings)
                 Label("Events", systemImage: "bell").tag(AppSection.events)
                     .badge(alerts.unseen)
-                Label("Device", systemImage: "server.rack").tag(AppSection.device)
+                Label("Device", systemImage: "info.circle").tag(AppSection.device)
                 Label("Settings", systemImage: "gearshape").tag(AppSection.settings)
             }
-            .navigationSplitViewColumnWidth(min: 160, ideal: 180, max: 240)
+            .safeAreaInset(edge: .top) { NVRSwitcher() }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
         } detail: {
             switch model.section {
             case .live: LiveView()
@@ -52,23 +53,24 @@ struct LiveView: View {
     @EnvironmentObject var model: AppModel
     @State private var renaming: Camera?
     @State private var renameText = ""
+    @State private var settingsFor: Camera?
 
     var body: some View {
         GeometryReader { geo in
             let rects = tileRects(geo.size)
             ZStack(alignment: .topLeading) {
                 Color.black
+                // Only the cameras on the current page are drawn (and streamed).
                 ForEach(Array(model.cameras.enumerated()), id: \.element.id) { i, cam in
-                    let r = rects[i]
-                    let visible = r != .zero
-                    TileView(camera: cam, index: i, isFocused: model.focused == i,
-                             isLarge: model.hdIndex == i,
-                             onRename: { renameText = cam.name; renaming = cam })
-                    .frame(width: max(r.width, 1), height: max(r.height, 1))
-                    .offset(x: r.minX, y: r.minY)
-                    .opacity(visible ? 1 : 0)
-                    .allowsHitTesting(visible)
-                    .zIndex(model.focused == i ? 1 : 0)
+                    if let r = rects[i] {
+                        TileView(camera: cam, index: i, isFocused: model.focused == i,
+                                 isLarge: model.hdIndex == i,
+                                 onRename: { renameText = cam.name; renaming = cam },
+                                 onSettings: { settingsFor = cam })
+                        .frame(width: max(r.width, 1), height: max(r.height, 1))
+                        .offset(x: r.minX, y: r.minY)
+                        .zIndex(model.focused == i ? 1 : 0)
+                    }
                 }
             }
         }
@@ -78,21 +80,24 @@ struct LiveView: View {
                 if model.focused != nil {
                     Button { model.focus(nil) } label: { Label("Back", systemImage: "arrow.down.right.and.arrow.up.left") }
                         .help("Back to the layout (Esc)")
-                } else if model.layout == .single {
-                    Button { model.stepPrimary(-1) } label: { Label("Previous Camera", systemImage: "chevron.left") }
-                    Button { model.stepPrimary(1) } label: { Label("Next Camera", systemImage: "chevron.right") }
+                } else if model.pageCount > 1 {
+                    Button { model.stepPage(-1) } label: { Label("Previous", systemImage: "chevron.left") }
+                        .help(model.layout == .single ? "Previous camera" : "Previous page")
+                    Text(model.layout == .single ? "\(model.page + 1) of \(model.cameras.count)" : "Page \(model.page + 1)/\(model.pageCount)")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                    Button { model.stepPage(1) } label: { Label("Next", systemImage: "chevron.right") }
+                        .help(model.layout == .single ? "Next camera" : "Next page")
                 }
                 Picker("Layout", selection: $model.layout) {
-                    Image(systemName: "square").help("1 camera").tag(LiveLayout.single)
-                    Image(systemName: "square.grid.2x2").help("2 × 2").tag(LiveLayout.grid)
-                    Image(systemName: "square.split.bottomrightquarter").help("1 large + 3 small").tag(LiveLayout.onePlusThree)
+                    ForEach(LiveLayout.allCases) { l in Text(l.label).tag(l) }
                 }
                 .pickerStyle(.segmented)
-                .help("Layout")
+                .help("Layout: cameras per page")
             }
         }
         .navigationTitle(model.focused.map { model.cameras[$0].displayName }
-                         ?? (model.layout == .single ? model.cameras[model.primary].displayName : "Live"))
+                         ?? (model.layout == .single ? (model.largeIndex.map { model.cameras[$0].displayName } ?? "Live")
+                             : "\(model.active.displayName) · Live"))
         .alert("Rename Camera", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Name", text: $renameText)
             Button("Save") { if let c = renaming { model.rename(c, to: renameText) } }
@@ -100,30 +105,44 @@ struct LiveView: View {
         } message: {
             Text("Channel \(renaming?.channel ?? 0)")
         }
+        .sheet(item: $settingsFor) { cam in CameraSettingsView(camera: cam) }
     }
 
-    /// Frame for each camera in the current layout; .zero = hidden.
-    private func tileRects(_ size: CGSize) -> [CGRect] {
-        let n = AppModel.channelCount, gap: CGFloat = 2
-        var rects = Array(repeating: CGRect.zero, count: n)
-        let full = CGRect(origin: .zero, size: size)
-        if let f = model.focused { rects[f] = full; return rects }
+    /// Frames for the cameras on the current page.
+    private func tileRects(_ size: CGSize) -> [Int: CGRect] {
+        var r: [Int: CGRect] = [:]
+        let gap: CGFloat = 2
+        if let f = model.focused { r[f] = CGRect(origin: .zero, size: size); return r }
+        let vis = Array(model.visibleRange)
         switch model.layout {
         case .single:
-            rects[model.primary] = full
-        case .grid:
-            let w = (size.width - gap) / 2, h = (size.height - gap) / 2
-            for i in 0..<n { rects[i] = CGRect(x: CGFloat(i % 2) * (w + gap), y: CGFloat(i / 2) * (h + gap), width: w, height: h) }
+            if let i = vis.first { r[i] = CGRect(origin: .zero, size: size) }
+        case .grid, .grid9, .grid16, .grid25:
+            let n = model.layout.columns
+            let w = (size.width - gap * CGFloat(n - 1)) / CGFloat(n), h = (size.height - gap * CGFloat(n - 1)) / CGFloat(n)
+            for (k, i) in vis.enumerated() {
+                r[i] = CGRect(x: CGFloat(k % n) * (w + gap), y: CGFloat(k / n) * (h + gap), width: w, height: h)
+            }
         case .onePlusThree:
-            let bigW = (size.width - gap) * 0.75
-            let smallW = size.width - gap - bigW
+            guard let big = model.largeIndex else { break }
+            let bigW = (size.width - gap) * 0.75, smallW = size.width - gap - bigW
             let smallH = (size.height - 2 * gap) / 3
-            rects[model.primary] = CGRect(x: 0, y: 0, width: bigW, height: size.height)
-            for (k, i) in (0..<n).filter({ $0 != model.primary }).enumerated() {
-                rects[i] = CGRect(x: bigW + gap, y: CGFloat(k) * (smallH + gap), width: smallW, height: smallH)
+            r[big] = CGRect(x: 0, y: 0, width: bigW, height: size.height)
+            for (k, i) in vis.filter({ $0 != big }).enumerated() {
+                r[i] = CGRect(x: bigW + gap, y: CGFloat(k) * (smallH + gap), width: smallW, height: smallH)
+            }
+        case .onePlusFive:
+            // 3×3 grid: the big camera takes the top-left 2×2, the others the remaining five cells.
+            guard let big = model.largeIndex else { break }
+            let w = (size.width - 2 * gap) / 3, h = (size.height - 2 * gap) / 3
+            r[big] = CGRect(x: 0, y: 0, width: 2 * w + gap, height: 2 * h + gap)
+            let cells = [(2, 0), (2, 1), (0, 2), (1, 2), (2, 2)]
+            for (k, i) in vis.filter({ $0 != big }).enumerated() where k < cells.count {
+                let (c, row) = cells[k]
+                r[i] = CGRect(x: CGFloat(c) * (w + gap), y: CGFloat(row) * (h + gap), width: w, height: h)
             }
         }
-        return rects
+        return r
     }
 }
 
@@ -136,6 +155,7 @@ struct TileView: View {
     let isFocused: Bool
     var isLarge = false
     let onRename: () -> Void
+    var onSettings: () -> Void = {}
     @State private var hovering = false
 
     var body: some View {
@@ -146,7 +166,7 @@ struct TileView: View {
                 .contentShape(Rectangle())
                 .gesture(TapGesture(count: 2).onEnded { model.toggleFocus(index) }
                     .exclusively(before: TapGesture().onEnded {
-                        if model.focused == nil && model.layout == .onePlusThree && model.primary != index { model.primary = index }
+                        if model.focused == nil && model.layout.hasLarge && model.largeIndex != index { model.makeLarge(index) }
                     }))
 
             if camera.status != .live && camera.status != .idle("") {
@@ -200,10 +220,11 @@ struct TileView: View {
         .onHover { hovering = $0 }
         .contextMenu {
             Button(isFocused ? "Back to Layout" : "View Full Size (HD)") { model.toggleFocus(index) }
-            if model.layout != .grid && model.primary != index && !isFocused {
-                Button("Make Large Camera") { model.primary = index }
+            if model.layout.hasLarge && model.layout != .single && model.largeIndex != index && !isFocused {
+                Button("Make Large Camera") { model.makeLarge(index) }
             }
             Button("Rename…", action: onRename)
+            Button("Camera Settings…", action: onSettings)
             Divider()
             Button("Copy Snapshot") { model.snapshot(camera) }.disabled(!camera.status.isLive)
             Button("Play Recordings from NVR…") {
@@ -487,6 +508,10 @@ struct ToastView: View {
 
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
+    @State private var name = ""
+    @State private var cameraCount = 4
+    @State private var detecting = false
+    @State private var confirmRemove = false
     @State private var host = ""
     @State private var rtspPort = ""
     @State private var dvripPort = ""
@@ -502,13 +527,58 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
+                ForEach(model.nvrs) { n in
+                    HStack {
+                        Image(systemName: n.id == model.activeID ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(n.id == model.activeID ? Color.accentColor : .secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(n.displayName)
+                            Text(n.host.isEmpty ? "Not set up" : "\(n.host) · \(n.cameraCount) camera\(n.cameraCount == 1 ? "" : "s")")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if n.id != model.activeID { Button("Switch") { model.selectNVR(n.id) } }
+                    }
+                }
+                HStack {
+                    Button { model.addNVR() } label: { Label("Add NVR", systemImage: "plus") }
+                    Spacer()
+                    Button(role: .destructive) { confirmRemove = true } label: { Label("Remove \(model.active.displayName)", systemImage: "trash") }
+                        .disabled(model.nvrs.count < 2)
+                }
+            } header: {
+                Text("NVRs")
+            } footer: {
+                Text("The settings below are for the selected NVR. Switch NVRs here or from the top of the sidebar.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
+                TextField("Name", text: $name, prompt: Text("e.g. Home, Shop"))
                 TextField("NVR IP address", text: $host, prompt: Text("192.168.1.x"))
                 TextField("RTSP port", text: $rtspPort, prompt: Text("554"))
                 TextField("DVRIP port", text: $dvripPort, prompt: Text("34567"))
                 TextField("Username", text: $user, prompt: Text("admin"))
                 SecureField("Password", text: $pass, prompt: Text("Required"))
+                HStack {
+                    Stepper(value: $cameraCount, in: 1...NVRConfig.maxCameras) {
+                        HStack {
+                            Text("Cameras")
+                            TextField("", value: $cameraCount, format: .number)
+                                .frame(width: 50)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                    Button {
+                        Task { await detect() }
+                    } label: {
+                        if detecting { ProgressView().controlSize(.small) } else { Text("Detect") }
+                    }
+                    .disabled(!valid || detecting)
+                    .help("Ask the NVR how many camera channels it has")
+                }
             } header: {
-                Text("NVR (XMEye-based, e.g. Securus Crimson)")
+                Text("\(model.active.displayName) (XMEye-based NVR, e.g. Securus Crimson)")
             } footer: {
                 Text("The password is stored in your Mac's Keychain.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -538,9 +608,11 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("Camera names") {
-                ForEach(names.indices, id: \.self) { i in
-                    TextField("Channel \(i + 1)", text: $names[i], prompt: Text("Camera \(i + 1)"))
+            Section {
+                DisclosureGroup("Camera names (\(cameraCount))") {
+                    ForEach(0..<cameraCount, id: \.self) { i in
+                        TextField("Channel \(i + 1)", text: nameBinding(i), prompt: Text("Camera \(i + 1)"))
+                    }
                 }
             }
 
@@ -564,16 +636,49 @@ struct SettingsView: View {
         .onAppear {
             guard !loaded else { return }
             loaded = true
-            host = model.host
-            rtspPort = String(model.port)
-            dvripPort = String(model.dvripPort)
-            user = model.username
-            pass = model.currentPassword
-            names = model.cameras.map(\.name)
+            load()
+        }
+        .onChange(of: model.activeID) { _, _ in load() }
+        .confirmationDialog("Remove \(model.active.displayName)?", isPresented: $confirmRemove) {
+            Button("Remove", role: .destructive) { model.removeActiveNVR() }
+        } message: {
+            Text("Its settings and saved password are deleted from this Mac. Nothing changes on the NVR.")
         }
         .onChange(of: model.passwordLoaded) { _, loaded in
             if loaded && pass.isEmpty { pass = model.currentPassword }
         }
+    }
+
+    private func load() {
+        let a = model.active
+        name = a.name
+        host = a.host
+        rtspPort = String(a.rtspPort)
+        dvripPort = String(a.dvripPort)
+        user = a.username
+        pass = model.currentPassword
+        cameraCount = a.cameraCount
+        names = model.cameras.map(\.name)
+        rtspNoAuth = TestResult(); rtspAuth = TestResult(); dvrip = TestResult()
+    }
+
+    private func nameBinding(_ i: Int) -> Binding<String> {
+        Binding(get: { i < names.count ? names[i] : "" },
+                set: { v in
+                    while names.count <= i { names.append("") }
+                    names[i] = v
+                })
+    }
+
+    private func detect() async {
+        detecting = true
+        if let n = await model.detectCameraCount(current) {
+            cameraCount = n
+            model.show(Toast(text: "The NVR reports \(n) camera channel\(n == 1 ? "" : "s")"))
+        } else {
+            model.show(Toast(text: "Couldn't read the camera count — check the login and DVRIP port", isError: true))
+        }
+        detecting = false
     }
 
     private var current: NVRSettings {
@@ -604,8 +709,9 @@ struct SettingsView: View {
 
     private func save() {
         let s = current
-        model.saveSettings(host: s.host, port: s.rtspPort, dvripPort: s.dvripPort,
-                           username: s.username, password: s.password,
+        model.saveSettings(name: name.trimmingCharacters(in: .whitespaces), host: s.host, port: s.rtspPort,
+                           dvripPort: s.dvripPort, username: s.username, password: s.password,
+                           cameraCount: cameraCount,
                            names: names.map { $0.trimmingCharacters(in: .whitespaces) })
     }
 }
@@ -637,5 +743,41 @@ struct TestRow: View {
         case .warning: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         case .failed: Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
+    }
+}
+
+// MARK: - NVR switcher
+
+/// Top of the sidebar: which NVR (site) is shown, plus "Add NVR…".
+struct NVRSwitcher: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Menu {
+            ForEach(model.nvrs) { n in
+                Button { model.selectNVR(n.id) } label: {
+                    if n.id == model.activeID { Label(n.displayName, systemImage: "checkmark") } else { Text(n.displayName) }
+                }
+            }
+            Divider()
+            Button("Add NVR…") { model.addNVR() }
+            Button("Manage NVRs…") { model.section = .settings }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "server.rack").foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(model.active.displayName).font(.headline).lineLimit(1)
+                    Text("\(model.cameras.count) camera\(model.cameras.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.up.chevron.down").font(.caption).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .help("Switch NVR")
     }
 }

@@ -194,6 +194,13 @@ final class DVRIPClient {
         return reply[name]
     }
 
+    /// Changes a setting (msg 1040, python-dvr set_info). Send back the whole object you read with
+    /// get() with only the field you want changed, so nothing else on the device is touched.
+    func set(_ name: String, _ value: Any, msg: UInt16 = 1040) async throws {
+        let reply = try await call(msg) { ["Name": name, "SessionID": $0, name: value] }
+        try Self.check(reply)
+    }
+
     /// Recordings on `channel` (0-based) that begin within from...to. Follows the NVR's
     /// 64-per-page limit by re-querying from the last item's BeginTime.
     func listFiles(channel: Int, from: Date, to: Date) async throws -> [DVRIPFile] {

@@ -31,10 +31,25 @@ enum Keychain {
         if status == errSecItemNotFound {
             var add = query(account)
             add[kSecValueData as String] = data
-            add[kSecAttrLabel as String] = "CCTV NVR password"
+            add[kSecAttrLabel as String] = account == "nvr-passwords" ? "CCTV NVR passwords" : "CCTV NVR password"
             return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
         }
         return status == errSecSuccess
+    }
+
+    /// All NVR passwords live in ONE Keychain item (JSON: NVR id → password), so an app update
+    /// asks for Keychain access once, however many NVRs there are. nil = item doesn't exist yet.
+    private static let mapAccount = "nvr-passwords"
+
+    static func passwordMap() -> [String: String]? {
+        guard let s = password(for: mapAccount), let d = s.data(using: .utf8) else { return nil }
+        return (try? JSONDecoder().decode([String: String].self, from: d)) ?? [:]
+    }
+
+    @discardableResult
+    static func setPasswordMap(_ map: [String: String]) -> Bool {
+        guard let d = try? JSONEncoder().encode(map), let s = String(data: d, encoding: .utf8) else { return false }
+        return setPassword(s, for: mapAccount)
     }
 }
 

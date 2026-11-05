@@ -64,6 +64,23 @@ watch live, or open the recording from the event log.
 <tr>
 <td valign="top">
 
+### 🎛 Camera settings
+Image (brightness, exposure, BLC, WDR-style highlight control, mirror/flip), day/night and light control,
+**video quality** (codec, resolution, fps, bitrate), **privacy masks** and **motion areas** drawn on the
+picture, person/tamper detection, a painted **weekly recording schedule**, copy to other cameras and backups.
+
+</td>
+<td valign="top">
+
+### 🏢 Many cameras, many NVRs
+Up to **100 cameras** per NVR with 1, 2×2, 3×3, 4×4, 5×5, 1+3 and 1+5 layouts and pages, and any number of
+NVRs (home, shop, office) with alerts from all of them.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
 ### 🧭 Menu bar
 Camera previews and recent alerts one click away. Keeps running when the window is closed;
 optional **open at login**. A **Device** page shows the NVR's model, firmware, network and disk usage.
@@ -127,13 +144,14 @@ Local Network → CCTV**.
 Live view uses the XMEye RTSP format:
 
 ```
-rtsp://USER:PASS@IP:554/user=USER&password=PASS&channel=N&stream=S.sdp   (N = 1…4, S = 0 main / 1 sub)
+rtsp://USER:PASS@IP:554/user=USER&password=PASS&channel=N&stream=S.sdp   (N = channel, S = 0 main / 1 sub)
 ```
 
 Recordings and alerts use the XMEye **DVRIP / Sofia** protocol on port 34567, implemented in
 [`App/DVRIP.swift`](App/DVRIP.swift) following [OpenIPC/python-dvr](https://github.com/OpenIPC/python-dvr).
 Built and tested with a **Securus Crimson** NVR (RTSP server "H264DVR 1.0"); many Xiongmai-based NVRs/DVRs
-sold under other brands should work. The app currently assumes 4 channels.
+sold under other brands should work. Camera settings use the NVR's own config names (`Camera.Param`,
+`Simplify.Encode`, `Detect.MotionDetect`, `Record`, …); anything a camera doesn't report is hidden.
 
 ---
 
